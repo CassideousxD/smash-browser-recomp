@@ -453,7 +453,8 @@ export class Pads {
         };
         const readBinding = (src, ...fallbackIndices) => {
           if (src !== undefined && src !== null) {
-            return readSource(pad, src);
+            const v = readSource(pad, src);
+            if (v > 0.1) return v;
           }
           for (const idx of fallbackIndices) {
             const v = btnVal(idx);
@@ -680,6 +681,24 @@ export function renderControllers(root, pads, labels, handle, { onDone }) {
       }
 
       children.push(row('Layout Presets',
+        button('🔥 Custom (X=Atk, A/Y=Jump)', 'pads.layout.custom', edit((h) => {
+          const prof = {
+            a: { type: 'button', index: 2 },
+            b: { type: 'button', index: 1 },
+            x: { type: 'button', index: 0 },
+            y: { type: 'button', index: 3 },
+            z: { type: 'button', index: 5 },
+            l: { type: 'button', index: 6 },
+            r: { type: 'button', index: 7 },
+            start: { type: 'button', index: 9 },
+            dpadUp: { type: 'button', index: 12 },
+            dpadDown: { type: 'button', index: 13 },
+            dpadLeft: { type: 'button', index: 14 },
+            dpadRight: { type: 'button', index: 15 },
+          };
+          saveCustomProfile(pad.id, prof);
+          app.pad_apply_preset(h, 'custom_direct');
+        })),
         button('🎮 Xbox / PC (A=A, B=B)', 'pads.layout.xbox', edit((h) => {
           clearCustomProfile(pad.id);
           app.pad_apply_preset(h, 'xbox');
