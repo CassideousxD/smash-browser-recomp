@@ -1,0 +1,22 @@
+/target
+/harness/.venv
+/harness/traces
+/harness/roms
+
+# Game dumps and proprietary Nintendo assets (DO NOT COMMIT)
+*.iso
+*.rvz
+*.gcm
+*.dol
+*.sav
+*.dat
+*.ssm
+*.sem
+*.dsp
+*.raw
+
+# Development artifacts
+*.jsonl
+__pycache__/
+.DS_Store
+.codex-runs/

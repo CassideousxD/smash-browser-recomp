@@ -1,0 +1,144 @@
+//! Shared damage and hitlag arithmetic; state transitions remain with owners.
+use crate::hurtbox::HurtHeight;
+use gekko_math::{fma::fmadds, msl::fctiwz};
+use melee_types::combat::HitboxDescriptor;
+#[derive(Clone, Debug)]
+pub struct ReceivedHit {
+    pub descriptor: HitboxDescriptor,
+    pub height: HurtHeight,
+    pub facing: f32,
+    pub knockback: f32,
+    pub facing_override: Option<f32>,
+    /// Added to the victim's percent when the reaction starts: the frame's
+    /// logged damage (dmg.x1838_percentTemp) for hits, the throw's damage.
+    pub percent_damage: f32,
+}
+/// The three ratios ftColl_80079AB0 scales a launch by: the match's damage
+/// ratio (StartMeleeRules x30, gm_8016B248), the attacker's handicap attack
+/// ratio and the victim's defense ratio (Player_GetAttackRatio,
+/// Player_GetDefenseRatio). All three are 1.0 in an ordinary Versus match.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KnockbackRatios {
+    pub stage: f32,
+    pub attack: f32,
+    pub defense: f32,
+}
+impl KnockbackRatios {
+    /// ftColl_80079EA8: no ratios.
+    pub const NONE: Self = Self {
+        stage: 1.0,
+        attack: 1.0,
+        defense: 1.0,
+    };
+    /// retail 80079B58-80079B60 (and 80079D6C-74 in ftColl_80079C70): three
+    /// separate fmuls after the formula, stage first, before the cap.
+    pub fn apply(self, knockback: f32) -> f32 {
+        self.defense * (self.attack * (self.stage * knockback))
+    }
+}
+pub struct KnockbackParameters {
+    pub weight_scale: f32,
+    pub weight_decay: f32,
+    pub fixed_percent: f32,
+    pub percent_scale: f32,
+    pub damage_scale: f32,
+    pub growth_scale: f32,
+    pub base: f32,
+    pub maximum: f32,
+}
+impl KnockbackParameters {
+    /// ftColl_80079AB0 (80079AB0), ordinary Vs 1.0 attack/defense/stage ratios.
+    pub fn knockback(&self, hit: &HitboxDescriptor, percent: f32, weight: f32) -> f32 {
+        self.knockback_with_damage(
+            hit,
+            percent,
+            weight,
+            fctiwz(hit.damage) as u32,
+            KnockbackRatios::NONE,
+        )
+    }
+    /// ftColl_80079AB0: the logged damage count precedes stale scaling.
+    pub fn knockback_with_damage(
+        &self,
+        hit: &HitboxDescriptor,
+        percent: f32,
+        weight: f32,
+        damage: u32,
+        ratios: KnockbackRatios,
+    ) -> f32 {
+        self.knockback_for_frame(hit, percent, hit.damage, weight, damage, ratios)
+    }
+    /// ftColl_80079AB0 in a damage log: the percent term is the victim's
+    /// damage count plus every hit logged this frame (dmg.x1838_percentTemp).
+    pub fn knockback_for_frame(
+        &self,
+        hit: &HitboxDescriptor,
+        percent: f32,
+        frame_damage: f32,
+        weight: f32,
+        damage: u32,
+        ratios: KnockbackRatios,
+    ) -> f32 {
+        let w = weight * self.weight_scale;
+        let factor = self.weight_decay - (w * self.weight_decay) / (1.0 + w);
+        let (p, d) = if hit.weight_knockback != 0 {
+            (self.fixed_percent, f32::from(hit.weight_knockback))
+        } else {
+            (fctiwz(percent) as f32 + frame_damage, damage as f32)
+        };
+        // retail 80079C34 (normal) / 80079B48 (fixed weight): fmadds.
+        let inner = fmadds(self.percent_scale, p, self.damage_scale * (d * p));
+        // retail 80079C40/C44 (fixed: 9B50/9B54).
+        let scaled = fmadds(self.growth_scale, factor * inner, self.base);
+        let result = ratios.apply(fmadds(
+            0.01 * f32::from(hit.growth),
+            scaled,
+            f32::from(hit.base_knockback),
+        ));
+        if result >= self.maximum {
+            self.maximum
+        } else {
+            result
+        }
+    }
+}
+/// ftCommon_CalcHitlag (8007DA74), 8007DAA8 fmadds then fctiwz, with the
+/// caller's cap (Fighter_ProcessHit 8006D738: fcmpo hitlag, x194; ble).
+pub fn hitlag(damage: i32, scale: f32, base: f32, maximum: f32) -> f32 {
+    gekko_math::cmp::min(fctiwz(fmadds(damage as f32, scale, base)) as f32, maximum)
+}
+/// Fighter_8006A1BC: report expiry so each owner applies its reaction flags.
+pub fn tick_hitlag(remaining: &mut f32) -> bool {
+    if *remaining > 0.0 {
+        *remaining -= 1.0;
+        if *remaining <= 0.0 {
+            *remaining = 0.0;
+            return true;
+        }
+    }
+    false
+}
+
+/// ftCo_CalcYScaledKnockback (0x800CF594, ftchangeparam.c): `value` for
+/// a fighter of model scale `scale` along one of PlCo's scale curves
+/// (Fighter_804D6524): linear in the scale, or, for a fighter smaller than
+/// 1 along a curve above 1, the shrink divided by the curve; a negative
+/// curve inverts the relation.
+pub fn y_scaled(value: f32, scale: f32, curve: f32) -> f32 {
+    assert!(scale != 0.0, "ftchangeparam.c:30: a zero scale");
+    if curve == 0.0 {
+        return value;
+    }
+    if curve < 0.0 {
+        // 800CF614..800CF688: the inlined call for 1.0 along -curve, then
+        // fdivs.
+        return value / y_scaled(1.0, scale, -curve);
+    }
+    if scale >= 1.0 || curve <= 1.0 {
+        // retail 0x800CF670..78 / 0x800CF6B0..B8: fsubs, fmuls, fmadds.
+        fmadds(curve, (scale - 1.0) * value, value)
+    } else {
+        // 0x800CF6C0: fmuls, fdivs.
+        value * scale / curve
+    }
+}

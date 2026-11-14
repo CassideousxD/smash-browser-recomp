@@ -1,0 +1,1014 @@
+//! The browser host's binding to libmelee. It mirrors the C API in
+//! `crates/melee-platform/include/melee_platform.h`: one `WebApp` over the
+//! shared [`melee_platform::app::App`], plus a WebGPU canvas surface. The
+//! page (`www/`) draws the menus as HTML and does the disc reads with
+//! `Blob.slice()`; this crate holds no rules of its own.
+#![cfg(target_arch = "wasm32")]
+
+use js_sys::{Array, Object, Reflect, Uint8Array, Uint8ClampedArray};
+use melee_platform::{
+    app::{App, Hud, LoadProgress, Outcome, Screen},
+    art::{ArtKind, Piece},
+    catalog,
+    disc::{DiscFiles, FileRequest},
+    players::{Controller, Mode, Rules, SPECIAL_MODES},
+    preview,
+    focus,
+    pads::{family, Family, Input, PadInfo, RawPad, Target, INPUT_COUNT},
+    session::{panic_replay, Action},
+    surface::WindowRenderer,
+};
+use std::{future::Future, time::Duration};
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+extern "C" {
+    /// Defined by index.html: shows the crash overlay, with the replay of
+    /// the panicking match when there is one.
+    #[wasm_bindgen(js_namespace = window, js_name = meleePanic)]
+    fn melee_panic(message: &str, replay: Option<Uint8Array>);
+}
+
+/// wasm32 aborts on panic. Before it does, hand the page the message and
+/// the running match's recording.
+#[wasm_bindgen(start)]
+pub fn start() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = info.to_string();
+        web_sys::console::error_1(&message.clone().into());
+        let replay = panic_replay::bytes().map(|bytes| Uint8Array::from(bytes.as_slice()));
+        melee_panic(&message, replay);
+    }));
+}
+
+fn object(fields: &[(&str, JsValue)]) -> JsValue {
+    let object = Object::new();
+    for (key, value) in fields {
+        Reflect::set(&object, &(*key).into(), value).expect("plain object");
+    }
+    object.into()
+}
+fn progress_object(p: LoadProgress) -> JsValue {
+    object(&[
+        ("filesDone", p.files_done.into()),
+        ("filesTotal", p.files_total.into()),
+        ("bytesDone", (p.bytes_done as f64).into()),
+        ("bytesTotal", (p.bytes_total as f64).into()),
+    ])
+}
+fn file_requests(requests: &[FileRequest]) -> Array {
+    requests
+        .iter()
+        .map(|r| {
+            object(&[
+                ("name", r.name.into()),
+                ("start", (r.range.start as f64).into()),
+                ("end", (r.range.end as f64).into()),
+            ])
+        })
+        .collect()
+}
+fn error(message: impl AsRef<str>) -> JsError {
+    JsError::new(message.as_ref())
+}
+
+/// Resolves in a later page task, so the page renders and handles input
+/// between two steps of preview work. A `MessageChannel` message rather
+/// than `setTimeout(0)`: timers are clamped (4 ms when nested, a second in
+/// hidden tabs), messages are not.
+fn next_task() -> impl Future<Output = ()> {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let posted = (|| -> Result<(), JsValue> {
+            let constructor: js_sys::Function =
+                Reflect::get(&js_sys::global(), &"MessageChannel".into())?.dyn_into()?;
+            let channel = Reflect::construct(&constructor, &Array::new())?;
+            let receiver = Reflect::get(&channel, &"port1".into())?;
+            let sender = Reflect::get(&channel, &"port2".into())?;
+            Reflect::set(&receiver, &"onmessage".into(), &resolve)?;
+            let post: js_sys::Function =
+                Reflect::get(&sender, &"postMessage".into())?.dyn_into()?;
+            post.call1(&sender, &0.into())?;
+            Ok(())
+        })();
+        if posted.is_err() {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    async move {
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+}
+
+/// `{characters: [{id, name, key, costumes, row, column}], stages: [{id, name, key, cpuSupported}]}`.
+#[wasm_bindgen]
+pub fn catalog() -> JsValue {
+    let characters: Array = catalog::characters()
+        .iter()
+        .enumerate()
+        .map(|(id, c)| {
+            let (row, column) = catalog::grid_cell(id as u32).unwrap_or_default();
+            object(&[
+                ("id", (id as u32).into()),
+                ("name", c.display_name().into()),
+                ("key", format!("{c:?}").into()),
+                ("costumes", c.costume_count().into()),
+                ("row", row.into()),
+                ("column", column.into()),
+            ])
+        })
+        .collect();
+    let stages: Array = catalog::stages()
+        .iter()
+        .enumerate()
+        .map(|(id, s)| {
+            object(&[
+                ("id", (id as u32).into()),
+                ("name", s.display_name().into()),
+                ("key", format!("{s:?}").into()),
+                ("cpuSupported", s.cpu_supported().into()),
+            ])
+        })
+        .collect();
+    object(&[("characters", characters.into()), ("stages", stages.into())])
+}
+
+/// Bytes of the disc header to read first.
+#[wasm_bindgen]
+pub fn header_len() -> u32 {
+    gc_disc::HEADER_LEN as u32
+}
+
+/// Validate the header and return `[start, end)` of the file table to read next.
+#[wasm_bindgen]
+pub fn fst_range(header: &[u8]) -> Result<Vec<f64>, JsError> {
+    let header = gc_disc::DiscHeader::parse(header).map_err(|e| error(e.to_string()))?;
+    header.require_melee().map_err(|e| error(e.to_string()))?;
+    let range = header.fst_range().map_err(|e| error(e.to_string()))?;
+    Ok(vec![range.start as f64, range.end as f64])
+}
+
+/// A WebGPU canvas with its device, made before it is handed to the app.
+#[wasm_bindgen]
+pub struct WebSurface(WindowRenderer);
+
+/// Request WebGPU for `canvas`. Rejects when the browser has no WebGPU.
+#[wasm_bindgen]
+pub async fn create_surface(canvas: web_sys::HtmlCanvasElement) -> Result<WebSurface, JsError> {
+    let size = [canvas.width().max(1), canvas.height().max(1)];
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::BROWSER_WEBGPU,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let surface = instance
+        .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
+        .map_err(|e| error(e.to_string()))?;
+    let renderer = WindowRenderer::new(&instance, surface, size)
+        .await
+        .map_err(error)?;
+    Ok(WebSurface(renderer))
+}
+
+fn hud_object(hud: &Hud) -> JsValue {
+    let players: Array = hud
+        .players
+        .iter()
+        .map(|p| {
+            object(&[
+                ("port", (p.port.index() as u32).into()),
+                ("character", catalog::character_id(p.character).into()),
+                ("costume", p.costume.into()),
+                ("percent", p.percent.into()),
+                ("stocks", p.stocks.into()),
+                ("cpu", p.cpu.into()),
+                ("team", p.team.map_or(-1, i32::from).into()),
+                ("score", p.score.into()),
+            ])
+        })
+        .collect();
+    object(&[
+        ("tick", (hud.tick as f64).into()),
+        ("paused", hud.paused.into()),
+        ("players", players.into()),
+        (
+            "secondsLeft",
+            hud.seconds_left.map_or(JsValue::NULL, |s| (s as f64).into()),
+        ),
+        ("timedScores", hud.timed_scores.into()),
+        ("suddenDeath", hud.sudden_death.into()),
+    ])
+}
+
+#[wasm_bindgen]
+pub struct WebApp {
+    app: App,
+    surface: Option<WindowRenderer>,
+}
+
+#[wasm_bindgen]
+impl WebApp {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self {
+            app: App::new(),
+            surface: None,
+        }
+    }
+
+    /// 0 disc, 1 characters, 2 stages, 3 loading, 4 match, 5 results.
+    pub fn screen(&self) -> u32 {
+        self.app.screen() as u32
+    }
+    /// A message for the user (load failure, match fault), cleared once read.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.app.take_notice()
+    }
+
+    // --- Disc
+    /// Open a disc from its header, file table and the image's size.
+    pub fn open_disc(&mut self, header: &[u8], fst: &[u8], image_len: f64) -> Result<(), JsError> {
+        let disc = DiscFiles::from_parts(header, fst, image_len as u64).map_err(error)?;
+        self.app.open_disc(disc).map_err(error)?;
+        self.start_previews();
+        Ok(())
+    }
+    /// `{gameId, title, revision, cachedFiles, cachedBytes}` or null.
+    pub fn disc_info(&self) -> JsValue {
+        let Some(disc) = self.app.disc() else {
+            return JsValue::NULL;
+        };
+        object(&[
+            ("gameId", disc.header().game_id.as_str().into()),
+            ("title", disc.header().title.as_str().into()),
+            ("revision", disc.header().revision.into()),
+            ("cachedFiles", (disc.cached_files() as u32).into()),
+            ("cachedBytes", (disc.cached_bytes() as f64).into()),
+        ])
+    }
+    pub fn resume_disc(&mut self) -> Result<(), JsError> {
+        self.app.resume_disc().map_err(error)
+    }
+    /// `[start, end]` byte range of `path` on the disc, or null if missing.
+    pub fn file_range(&self, path: &str) -> Option<Array> {
+        let range = self.app.file_range(path)?;
+        let arr = Array::new();
+        arr.push(&(range.start as f64).into());
+        arr.push(&(range.end as f64).into());
+        Some(arr)
+    }
+
+    // --- Menu art
+    /// `[{name, start, end}]`: the menu archives still to read, then the
+    /// files the stage previews render from (about 16 MB); hand each to
+    /// `provide_file` (any screen) after `open_disc`. `art_ready()` turns
+    /// true once the menu archives are in.
+    pub fn art_files(&self) -> Array {
+        file_requests(&self.app.art_requests())
+    }
+    pub fn art_ready(&self) -> bool {
+        self.app.art_ready()
+    }
+    /// `{filesDone, filesTotal, bytesDone, bytesTotal}` of the menu archives.
+    pub fn art_progress(&self) -> JsValue {
+        progress_object(self.app.art_progress())
+    }
+    /// `{width, height, data}` with `data` a `Uint8ClampedArray` of RGBA8
+    /// (straight alpha, native size: `new ImageData(data, width, height)`).
+    /// `kind` is `melee_art_e`'s number (0 portrait, 1 face, 2 stock,
+    /// 3 character emblem, 4 stage icon, 5 stage name, 6 stage emblem,
+    /// 7 stage preview); `id` a character or stage id. Throws until the art
+    /// is read and where retail has no such image. A stage preview (1920x1080,
+    /// opaque, rendered by the core once the disc's files are in and a
+    /// surface is set) is null until it is rendered, and stays null if it
+    /// could not be: poll it when redrawing, with a placeholder meanwhile.
+    pub fn art(&mut self, kind: u32, id: u32, costume: u8) -> Result<JsValue, JsError> {
+        let kind = ArtKind::from_u32(kind).ok_or(error("no art kind with that number"))?;
+        let piece = Piece::new(kind, id, costume).map_err(error)?;
+        let image = match (kind, self.app.art_image(piece)) {
+            (_, Ok(image)) => image,
+            (ArtKind::StagePreview, Err(_)) => return Ok(JsValue::NULL),
+            (_, Err(message)) => return Err(error(message)),
+        };
+        let data = Uint8ClampedArray::new_with_length(image.rgba.len() as u32);
+        data.copy_from(&image.rgba);
+        Ok(object(&[
+            ("width", image.width.into()),
+            ("height", image.height.into()),
+            ("data", data.into()),
+        ]))
+    }
+
+    // --- Character select
+    /// `{players: [{controller (0 off, 1 human, 2 CPU), character (id or
+    /// -1), costume, cpuLevel, team}] (four), ready, notReady (why not, or
+    /// null)}`.
+    pub fn selection(&self) -> JsValue {
+        let players: Array = self
+            .app
+            .slots()
+            .iter()
+            .map(|slot| {
+                object(&[
+                    ("controller", (slot.controller as u32).into()),
+                    (
+                        "character",
+                        slot.character
+                            .map_or(-1, |c| catalog::character_id(c) as i32)
+                            .into(),
+                    ),
+                    ("costume", slot.costume.into()),
+                    ("cpuLevel", slot.cpu_level.into()),
+                    ("team", slot.team.into()),
+                    ("handicap", slot.handicap.into()),
+                ])
+            })
+            .collect();
+        object(&[
+            ("players", players.into()),
+            ("ready", self.app.characters_ready().into()),
+            (
+                "notReady",
+                self.app
+                    .characters_not_ready()
+                    .map_or(JsValue::NULL, JsValue::from),
+            ),
+        ])
+    }
+    /// 0 off, 1 human, 2 CPU.
+    pub fn set_controller(&mut self, player: u32, controller: u32) -> Result<(), JsError> {
+        let controller = Controller::from_u32(controller).ok_or(error("no such controller"))?;
+        self.app
+            .set_controller(player as usize, controller)
+            .map_err(error)
+    }
+    pub fn set_cpu_level(&mut self, player: u32, level: u8) -> Result<(), JsError> {
+        self.app
+            .set_cpu_level(player as usize, level)
+            .map_err(error)
+    }
+    /// 1..9, or 0 for none.
+    pub fn set_handicap(&mut self, player: u32, handicap: u8) -> Result<(), JsError> {
+        self.app
+            .set_handicap(player as usize, handicap)
+            .map_err(error)
+    }
+    /// 0 red, 1 blue, 2 green.
+    pub fn set_team(&mut self, player: u32, team: u8) -> Result<(), JsError> {
+        self.app.set_team(player as usize, team).map_err(error)
+    }
+    /// `{mode (0 stock, 1 time), stocks, timeMinutes (0 none, 1..99), teams,
+    /// friendlyFire, itemFrequency (-1 off, 0..4), damageRatio (tenths,
+    /// 5..20), special (0 none, 1 Super Sudden Death, 2 Lightning, 3 Slo-Mo)}`.
+    pub fn rules(&self) -> JsValue {
+        let rules = self.app.rules();
+        let special = rules.special.map_or(0, |mode| {
+            SPECIAL_MODES
+                .iter()
+                .position(|&m| m == mode)
+                .map_or(0, |i| i as u32 + 1)
+        });
+        object(&[
+            ("mode", (rules.mode as u32).into()),
+            ("timeMinutes", rules.time_minutes.unwrap_or(0).into()),
+            ("damageRatio", rules.damage_ratio_tenths.into()),
+            ("special", special.into()),
+            ("stocks", rules.stocks.into()),
+            ("teams", rules.teams.into()),
+            ("friendlyFire", rules.friendly_fire.into()),
+            (
+                "itemFrequency",
+                rules.item_frequency.map_or(-1, i32::from).into(),
+            ),
+        ])
+    }
+    /// The fields of [`WebApp::rules`]; missing ones keep their value.
+    pub fn set_rules(&mut self, rules: JsValue) -> Result<(), JsError> {
+        let current = self.app.rules();
+        let field = |name: &str| {
+            Reflect::get(&rules, &name.into())
+                .ok()
+                .filter(|v| !v.is_undefined())
+        };
+        let number = |name: &str| field(name).and_then(|v| v.as_f64());
+        let flag = |name: &str| field(name).and_then(|v| v.as_bool());
+        let mode = match number("mode") {
+            Some(v) => Mode::from_u32(v as u32).ok_or(error("no such match mode"))?,
+            None => current.mode,
+        };
+        let special = match number("special") {
+            Some(v) if v >= 1.0 => Some(
+                *SPECIAL_MODES
+                    .get(v as usize - 1)
+                    .ok_or(error("no such Special Melee mode"))?,
+            ),
+            Some(_) => None,
+            None => current.special,
+        };
+        let rules = Rules {
+            mode,
+            special,
+            time_minutes: number("timeMinutes")
+                .map_or(current.time_minutes, |v| (v >= 1.0).then_some(v as u8)),
+            damage_ratio_tenths: number("damageRatio")
+                .map_or(current.damage_ratio_tenths, |v| v as u8),
+            stocks: number("stocks").map_or(current.stocks, |v| v as u8),
+            teams: flag("teams").unwrap_or(current.teams),
+            friendly_fire: flag("friendlyFire").unwrap_or(current.friendly_fire),
+            item_frequency: number("itemFrequency")
+                .map_or(current.item_frequency, |v| (v >= 0.0).then_some(v as u8)),
+        };
+        self.app.set_rules(rules).map_err(error)
+    }
+    /// Why `stage` cannot host the current picks, or null when it can.
+    pub fn stage_unavailable(&self, stage: u32) -> Option<String> {
+        let stage = catalog::stage(stage)?;
+        self.app.stage_unavailable(stage).map(str::to_owned)
+    }
+    /// `character` -1 clears the pick.
+    pub fn choose_character(&mut self, player: u32, character: i32) -> Result<(), JsError> {
+        if character < 0 {
+            return self.app.unchoose_character(player as usize).map_err(error);
+        }
+        let character = catalog::character(character as u32).ok_or(error("no such character"))?;
+        self.app
+            .choose_character(player as usize, character)
+            .map_err(error)
+    }
+    pub fn set_costume(&mut self, player: u32, costume: u8) -> Result<(), JsError> {
+        self.app
+            .set_costume(player as usize, costume)
+            .map_err(error)
+    }
+    pub fn cycle_costume(&mut self, player: u32, step: i32) -> Result<(), JsError> {
+        self.app.cycle_costume(player as usize, step).map_err(error)
+    }
+    pub fn confirm_characters(&mut self) -> Result<(), JsError> {
+        self.app.confirm_characters().map_err(error)
+    }
+    pub fn back(&mut self) {
+        self.app.back();
+        self.sync_scene();
+    }
+
+    // --- Stage select and loading
+    pub fn choose_stage(&mut self, stage: u32, seed: u32) -> Result<(), JsError> {
+        let stage = catalog::stage(stage).ok_or(error("no such stage"))?;
+        self.app.choose_stage(stage, seed).map_err(error)
+    }
+    /// `{filesDone, filesTotal, bytesDone, bytesTotal}`.
+    pub fn load_progress(&self) -> JsValue {
+        progress_object(self.app.load_progress())
+    }
+    /// `[{name, start, end}]`: the disc byte ranges still to read.
+    pub fn pending_files(&self) -> Array {
+        file_requests(&self.app.pending_requests())
+    }
+    pub fn provide_file(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), JsError> {
+        self.app.provide_file(name, bytes).map_err(error)?;
+        self.start_previews();
+        Ok(())
+    }
+    /// Whether every stage preview is rendered (or failed and left to the
+    /// page's placeholder).
+    pub fn stage_previews_ready(&self) -> bool {
+        self.app.stage_previews_ready()
+    }
+    /// The page could not read a file: back to stage select with `message`.
+    pub fn fail_loading(&mut self, message: String) {
+        self.app.fail_loading(message);
+    }
+    /// Build the match from the read files; on failure the notice says why.
+    pub fn finish_loading(&mut self) -> Result<(), JsError> {
+        self.app.finish_loading().map_err(error)?;
+        self.sync_scene();
+        if self.app.screen() != Screen::Match {
+            return Err(error(
+                self.app.notice().unwrap_or("the match could not be drawn"),
+            ));
+        }
+        Ok(())
+    }
+
+    // --- Surface
+    pub fn set_surface(&mut self, surface: WebSurface) {
+        self.surface = Some(surface.0);
+        self.sync_scene();
+        self.start_previews();
+    }
+
+    // --- Match
+    /// Advance by `elapsed_ms` of page time and draw at the canvas size.
+    pub fn frame(&mut self, elapsed_ms: f64, width: u32, height: u32) -> Result<(), JsError> {
+        // Page time can step backwards, and NaN must not reach Duration.
+        let seconds = if elapsed_ms > 0.0 {
+            elapsed_ms / 1000.0
+        } else {
+            0.0
+        };
+        let elapsed = Duration::from_secs_f64(seconds);
+        let advanced = self.app.advance(elapsed);
+        self.sync_scene();
+        if let Some(surface) = &mut self.surface {
+            if width > 0 && height > 0 {
+                surface.resize([width, height]);
+                surface
+                    .draw(self.app.session().map(|s| s.presentation()))
+                    .map_err(error)?;
+            }
+        }
+        advanced.map_err(error)
+    }
+    /// Benchmarking (`?perf`): queue `frames` offscreen draws of the current
+    /// scene at the canvas size. Time it with [`WebApp::gpu_idle`]; works in
+    /// background tabs, where animation frames stop.
+    pub fn draw_offscreen(&mut self, frames: u32) -> Result<(), JsError> {
+        let surface = self.surface.as_mut().ok_or_else(|| error("no surface"))?;
+        let scene = self
+            .app
+            .session()
+            .map(|s| s.presentation())
+            .ok_or_else(|| error("no match is running"))?;
+        surface.draw_offscreen(scene, frames).map_err(error)
+    }
+    /// Resolves once the GPU has finished all submitted work.
+    pub fn gpu_idle(&self) -> Result<js_sys::Promise, JsError> {
+        let queue = self
+            .surface
+            .as_ref()
+            .ok_or_else(|| error("no surface"))?
+            .queue()
+            .clone();
+        Ok(js_sys::Promise::new(&mut |resolve, _| {
+            queue.on_submitted_work_done(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+        }))
+    }
+    pub fn needs_frame(&self) -> bool {
+        self.app.screen() == Screen::Match && self.app.session().is_some_and(|s| s.needs_frame())
+    }
+    /// Poll combat and simulation audio events queued during recent ticks.
+    pub fn poll_audio_events(&mut self) -> js_sys::Array {
+        let events = self.app.poll_audio_events();
+        let array = js_sys::Array::new_with_length(events.len() as u32);
+        for (i, ev) in events.into_iter().enumerate() {
+            let obj = object(&[
+                ("port", (ev.port as f64).into()),
+                ("character", (catalog::character_id(ev.character) as f64).into()),
+                ("channel", (ev.channel as f64).into()),
+                ("id", (ev.id as f64).into()),
+                ("volume", (ev.volume as f64).into()),
+                ("pan", (ev.pan as f64).into()),
+            ]);
+            array.set(i as u32, obj);
+        }
+        array
+    }
+    /// Match status string: "startup", "playing", "finished", or null if no match.
+    pub fn match_status(&self) -> Option<String> {
+        let session = self.app.session()?;
+        Some(match session.game().status() {
+            melee_lib::MatchStatus::Startup => "startup".to_string(),
+            melee_lib::MatchStatus::Playing => "playing".to_string(),
+            melee_lib::MatchStatus::Finished(_) => "finished".to_string(),
+            melee_lib::MatchStatus::Faulted => "faulted".to_string(),
+        })
+    }
+    /// `action`: 0 left, 1 right, 2 up, 3 down, 4 attack, 5 special, 6 jump, 7 shield, 8 grab.
+    /// Keyboard layout `device` drives the match's `device`th human player.
+    pub fn action(&mut self, device: u32, action: u32, down: bool) {
+        if let Ok(action) = Action::try_from(action) {
+            self.app.set_action(device as usize, action, down);
+        }
+    }
+    // --- Gamepads (the C API's melee_app_pad_*)
+    /// A pad appeared: `handle` is the page's (the Gamepad's index), `id`
+    /// its `Gamepad.id` (USB ids and name). Returns the family index.
+    pub fn pad_connect(&mut self, handle: u32, id: &str) -> u32 {
+        let (vendor, product, name) = family::parse_web_id(id);
+        self.app.pad_connect(handle, &name, "", vendor, product);
+        self.app
+            .pads()
+            .info(handle)
+            .map_or(0, |info| family_index(info.family))
+    }
+    pub fn pad_disconnect(&mut self, handle: u32) {
+        self.app.pad_disconnect(handle);
+    }
+    /// Report a pad every frame on every screen: `buttons` are the
+    /// Gamepad's button values in standard order, `axes` its axes as the
+    /// Gamepad API gives them (y down). Returns `melee_menu_event_e` bits.
+    pub fn pad_update(&mut self, handle: u32, buttons: &[f32], axes: &[f32], now_ms: f64) -> u32 {
+        let mut raw = RawPad::default();
+        for (slot, value) in raw.buttons.iter_mut().zip(buttons) {
+            *slot = *value;
+        }
+        let axis = |i: usize| axes.get(i).copied().unwrap_or(0.0);
+        raw.axes = [axis(0), -axis(1), axis(2), -axis(3)];
+        self.app.pad_update(handle, &raw, now_ms).0
+    }
+    /// Connected pads, oldest first: `[{handle, family, familyName, name,
+    /// port (or -1), listening (target or -1), bindings (target per input),
+    /// deadzone, triggerClick, buttons, stick, cstick, triggers}]`.
+    pub fn pads(&self) -> Array {
+        let pads = self.app.pads();
+        pads.handles()
+            .into_iter()
+            .filter_map(|h| pads.info(h))
+            .map(|info| pad_object(&info))
+            .collect()
+    }
+    pub fn pad_bind(&mut self, handle: u32, input: u32, target: u32) {
+        let (Some(input), Some(target)) = (Input::from_index(input as usize), Target::from_index(target)) else {
+            return;
+        };
+        if let Some(mut settings) = self.app.pads().settings(handle) {
+            settings.bind(input, target);
+            self.app.pads_mut().set_settings(handle, settings);
+        }
+    }
+    pub fn pad_swap_ab(&mut self, handle: u32) {
+        if let Some(mut settings) = self.app.pads().settings(handle) {
+            settings.swap_ab();
+            self.app.pads_mut().set_settings(handle, settings);
+        }
+    }
+    pub fn pad_set_deadzone(&mut self, handle: u32, deadzone: f32) {
+        if let Some(mut settings) = self.app.pads().settings(handle) {
+            settings.set_deadzone(deadzone);
+            self.app.pads_mut().set_settings(handle, settings);
+        }
+    }
+    pub fn pad_set_trigger_click(&mut self, handle: u32, click: f32) {
+        if let Some(mut settings) = self.app.pads().settings(handle) {
+            settings.set_trigger_click(click);
+            self.app.pads_mut().set_settings(handle, settings);
+        }
+    }
+    pub fn pad_reset(&mut self, handle: u32) {
+        self.app.pads_mut().reset(handle);
+    }
+    pub fn pad_apply_preset(&mut self, handle: u32, preset: &str) {
+        self.app.pads_mut().apply_preset(handle, preset);
+    }
+    /// Bind the pad's next new press to `target` (-1 stops waiting).
+    pub fn pad_listen(&mut self, handle: u32, target: i32) {
+        let target = u32::try_from(target).ok().and_then(Target::from_index);
+        self.app.pads_mut().listen(handle, target);
+    }
+    /// Give a pad a controller port (-1 frees it).
+    pub fn pad_assign(&mut self, handle: u32, port: i32) {
+        self.app.assign_pad(handle, usize::try_from(port).ok());
+    }
+    /// Saved settings of every controller seen, for localStorage.
+    pub fn pad_prefs(&self) -> String {
+        self.app.pads().prefs()
+    }
+    pub fn pad_load_prefs(&mut self, prefs: &str) {
+        self.app.pads_mut().load_prefs(prefs);
+    }
+    pub fn set_paused(&mut self, paused: bool) {
+        if let Some(session) = self.app.session_mut() {
+            session.pause(paused);
+        }
+    }
+    pub fn set_focused(&mut self, focused: bool) {
+        if let Some(session) = self.app.session_mut() {
+            session.set_focused(focused);
+        }
+    }
+    pub fn is_paused(&self) -> bool {
+        self.app.session().is_some_and(|s| s.is_paused())
+    }
+    pub fn faulted(&self) -> bool {
+        self.app.session().is_some_and(|s| s.failure().is_some())
+    }
+    /// `{tick, paused, players: [{port, character, costume, percent, stocks, cpu, team}]}` or null.
+    pub fn hud(&self) -> JsValue {
+        self.app.hud().map_or(JsValue::NULL, |hud| hud_object(&hud))
+    }
+    /// `{winner (player index or -1), winningTeam (team or -1), hud}` or null.
+    pub fn results(&self) -> JsValue {
+        let Some(results) = self.app.results() else {
+            return JsValue::NULL;
+        };
+        let (winner, team) = match results.outcome {
+            Outcome::Winner(index) => (index as i32, -1),
+            Outcome::Team(team) => (-1, i32::from(team)),
+            Outcome::Draw => (-1, -1),
+        };
+        object(&[
+            ("winner", winner.into()),
+            ("winningTeam", team.into()),
+            ("hud", hud_object(&results.hud)),
+        ])
+    }
+    pub fn restart(&mut self) -> Result<(), JsError> {
+        self.app.restart().map_err(error)
+    }
+    pub fn rematch(&mut self, seed: u32) -> Result<(), JsError> {
+        self.app.rematch(seed).map_err(error)?;
+        self.sync_scene();
+        Ok(())
+    }
+    pub fn quit_to_menu(&mut self) {
+        self.app.quit_to_menu();
+        self.sync_scene();
+    }
+    /// The match's input recording (melee-replay JSON) for a download.
+    pub fn replay_bytes(&self) -> Result<Vec<u8>, JsError> {
+        self.app
+            .session()
+            .ok_or(error("no match to save"))?
+            .replay_bytes()
+            .map_err(error)
+    }
+}
+
+impl Default for WebApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebApp {
+    /// Render the stage previews once the disc's files are in and the
+    /// canvas gives a device: one step at a time between page tasks, on the
+    /// canvas's own device. Each preview logs its time to the console.
+    fn start_previews(&mut self) {
+        let Some(surface) = &self.surface else {
+            return;
+        };
+        let Some(job) = self.app.stage_preview_job() else {
+            return;
+        };
+        let gpu = surface.preview_gpu();
+        wasm_bindgen_futures::spawn_local(async move {
+            let start = js_sys::Date::now();
+            let previews = job.previews.clone();
+            // The longest stretch of work between two pauses: how long the
+            // page could not render.
+            let last = std::rc::Rc::new(std::cell::Cell::new(start));
+            let longest = std::rc::Rc::new(std::cell::Cell::new(0.0f64));
+            let pause = || {
+                let worked = js_sys::Date::now() - last.get();
+                if worked > longest.get() {
+                    longest.set(worked);
+                }
+                let last = std::rc::Rc::clone(&last);
+                async move {
+                    next_task().await;
+                    last.set(js_sys::Date::now());
+                }
+            };
+            preview::run(job, gpu, pause, js_sys::Date::now, |stage, result, ms| {
+                let line = preview::describe(stage, result, ms);
+                match result {
+                    Ok(_) => web_sys::console::log_1(&line.into()),
+                    Err(_) => web_sys::console::warn_1(&line.into()),
+                }
+            })
+            .await;
+            web_sys::console::log_1(
+                &format!(
+                    "stage previews: {} in {:.0} ms, at most {:.0} ms between pauses",
+                    if previews.ready() {
+                        "ready"
+                    } else {
+                        "incomplete"
+                    },
+                    js_sys::Date::now() - start,
+                    longest.get()
+                )
+                .into(),
+            );
+        });
+    }
+    fn sync_scene(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            surface.follow(&mut self.app);
+        }
+    }
+}
+
+fn family_index(family: Family) -> u32 {
+    Family::ALL.iter().position(|f| *f == family).unwrap_or_default() as u32
+}
+fn pad_object(info: &PadInfo) -> JsValue {
+    let signed = |values: &[i8]| values.iter().map(|v| JsValue::from(*v)).collect::<Array>();
+    let unsigned = |values: &[u8]| values.iter().map(|v| JsValue::from(*v)).collect::<Array>();
+    let bindings: Array = info
+        .settings
+        .bindings
+        .iter()
+        .map(|t| JsValue::from(t.index()))
+        .collect();
+    object(&[
+        ("handle", info.handle.into()),
+        ("family", family_index(info.family).into()),
+        ("familyName", info.family.name().into()),
+        ("name", info.name.as_str().into()),
+        ("port", info.port.map_or(-1, |p| p as i32).into()),
+        ("listening", info.listening.map_or(-1, |t| t.index() as i32).into()),
+        ("bindings", bindings.into()),
+        ("deadzone", info.settings.deadzone.into()),
+        ("triggerClick", info.settings.trigger_click.into()),
+        ("buttons", info.state.buttons.into()),
+        ("stick", signed(&info.state.stick).into()),
+        ("cstick", signed(&info.state.cstick).into()),
+        ("triggers", unsigned(&info.state.triggers).into()),
+    ])
+}
+
+/// Labels for a controller settings screen: `{families: [name], inputs:
+/// [[label per input] per family], positions: [per input], targets: [name
+/// per melee_pad_target_e], inputCount}`.
+#[wasm_bindgen]
+pub fn pad_labels() -> JsValue {
+    let strings = |items: Vec<&str>| items.into_iter().map(JsValue::from).collect::<Array>();
+    let inputs: Array = Family::ALL
+        .iter()
+        .map(|f| JsValue::from(strings(Input::ALL.iter().map(|i| f.label(*i)).collect())))
+        .collect();
+    let targets = (0..=Target::ALL.len() as u32)
+        .map(|t| Target::from_index(t).unwrap_or_default().name())
+        .collect();
+    object(&[
+        ("families", strings(Family::ALL.iter().map(|f| f.name()).collect()).into()),
+        ("inputs", inputs.into()),
+        ("positions", strings(Input::ALL.iter().map(|i| i.position()).collect()).into()),
+        ("targets", strings(targets).into()),
+        ("inputCount", (INPUT_COUNT as u32).into()),
+    ])
+}
+
+/// Menu focus movement (`melee_focus_next`): `frames` are x, y, width,
+/// height per control; direction 0 up, 1 down, 2 left, 3 right; -1 for none.
+#[wasm_bindgen]
+pub fn focus_next(frames: &[f32], from: u32, direction: u32) -> i32 {
+    let Some(direction) = focus::Direction::from_index(direction) else {
+        return -1;
+    };
+    let frames: Vec<focus::Frame> = frames
+        .chunks_exact(4)
+        .map(|c| [c[0], c[1], c[2], c[3]])
+        .collect();
+    focus::next(&frames, from as usize, direction).map_or(-1, |i| i as i32)
+}
+
+/// Decode a Nintendo GameCube .hps audio file into PCM samples for Web Audio API.
+#[wasm_bindgen]
+pub fn decode_hps(bytes: &[u8]) -> Result<JsValue, JsError> {
+    let hps: hps_decode::Hps = bytes.try_into().map_err(|e| error(format!("{e:?}")))?;
+    let loop_sample_index: Option<usize> = hps.loop_block_index.map(|index| {
+        hps.blocks[..index]
+            .iter()
+            .map(|b| b.frames.len())
+            .sum::<usize>()
+            * 14
+    });
+    let audio = hps.decode().map_err(|e| error(format!("{e:?}")))?;
+    let samples = audio.samples();
+    let int16_array = js_sys::Int16Array::new_with_length(samples.len() as u32);
+    int16_array.copy_from(samples);
+    Ok(object(&[
+        ("sampleRate", audio.sample_rate.into()),
+        ("channelCount", audio.channel_count.into()),
+        (
+            "loopSampleIndex",
+            match loop_sample_index {
+                Some(idx) => (idx as f64).into(),
+                None => JsValue::NULL,
+            },
+        ),
+        ("samples", int16_array.into()),
+    ]))
+}
+
+#[inline]
+fn clamp16(val: i32) -> i16 {
+    if val > 32767 {
+        32767
+    } else if val < -32768 {
+        -32768
+    } else {
+        val as i16
+    }
+}
+
+/// Decode a single sound clip from a Nintendo GameCube .ssm audio bank into PCM samples.
+#[wasm_bindgen]
+pub fn decode_ssm(bytes: &[u8], clip_index: u32) -> Result<JsValue, JsError> {
+    if bytes.len() < 16 {
+        return Err(error("SSM file is too small"));
+    }
+    let header_data_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let data_size = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let count = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+
+    if (clip_index as usize) >= count {
+        return Err(error(format!("clip_index {} out of bounds (count {})", clip_index, count)));
+    }
+
+    let header_end = 16 + header_data_size;
+    let audio_start = (header_end + 31) & !31;
+
+    let mut entry_offset = 16usize;
+    for _ in 0..clip_index {
+        if entry_offset + 4 > header_end {
+            return Err(error("SSM clip entry offset is out of range"));
+        }
+        let ch = u32::from_be_bytes([bytes[entry_offset], bytes[entry_offset + 1], bytes[entry_offset + 2], bytes[entry_offset + 3]]);
+        entry_offset += if ch == 2 { 136 } else { 72 };
+    }
+
+    if entry_offset + 72 > header_end || audio_start + data_size > bytes.len() {
+        return Err(error("SSM clip entry offset is out of range"));
+    }
+
+    let entry = &bytes[entry_offset..entry_offset + 72];
+    let channel_count = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
+    let sample_rate = u32::from_be_bytes([entry[4], entry[5], entry[6], entry[7]]);
+    let _loop_flag = u32::from_be_bytes([entry[8], entry[9], entry[10], entry[11]]);
+    let start_sample = u32::from_be_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+    let end_sample = u32::from_be_bytes([entry[16], entry[17], entry[18], entry[19]]) as usize;
+    let loop_sample = u32::from_be_bytes([entry[20], entry[21], entry[22], entry[23]]) as usize;
+
+    let mut coefs = [0i16; 16];
+    for i in 0..16 {
+        coefs[i] = i16::from_be_bytes([entry[24 + i * 2], entry[25 + i * 2]]);
+    }
+
+    let start_frame = start_sample / 16;
+    let end_frame = end_sample / 16;
+    let byte_offset = start_frame * 8;
+    let audio_slice = &bytes[audio_start..];
+
+    if byte_offset >= audio_slice.len() {
+        return Err(error("SSM audio start offset out of range"));
+    }
+
+    let adpcm_bytes = &audio_slice[byte_offset..];
+    let sample_capacity = (end_sample.saturating_sub(start_sample)) * 14 / 16 + 16;
+    let mut samples: Vec<i16> = Vec::with_capacity(sample_capacity);
+    let mut hist1: i32 = 0;
+    let mut hist2: i32 = 0;
+
+    static NIBBLE_TO_I8: [i8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1];
+
+    let total_frames = end_frame.saturating_sub(start_frame) + 1;
+    for f in 0..total_frames {
+        let f_byte_start = f * 8;
+        if f_byte_start + 8 > adpcm_bytes.len() {
+            break;
+        }
+        let frame_idx = start_frame + f;
+        let header_byte = adpcm_bytes[f_byte_start];
+        let scale = 1i32 << (header_byte & 0x0F);
+        let coef_idx = ((header_byte >> 4) & 0x0F) as usize;
+        let c1 = coefs[(coef_idx * 2) & 0x0F] as i32;
+        let c2 = coefs[(coef_idx * 2 + 1) & 0x0F] as i32;
+
+        let frame_payload = &adpcm_bytes[f_byte_start + 1..f_byte_start + 8];
+        for (b_idx, &b) in frame_payload.iter().enumerate() {
+            let high_nibble = NIBBLE_TO_I8[((b >> 4) & 0x0F) as usize] as i32;
+            let low_nibble = NIBBLE_TO_I8[(b & 0x0F) as usize] as i32;
+
+            for (s_sub, nibble) in [high_nibble, low_nibble].into_iter().enumerate() {
+                let curr_nibble = frame_idx * 16 + (b_idx + 1) * 2 + s_sub;
+                let val = (((nibble * scale) << 11) + 1024 + (c1 * hist1 + c2 * hist2)) >> 11;
+                let clamped = clamp16(val);
+                hist2 = hist1;
+                hist1 = clamped as i32;
+
+                if curr_nibble >= start_sample && curr_nibble <= end_sample {
+                    samples.push(clamped);
+                }
+            }
+        }
+    }
+
+    let int16_array = js_sys::Int16Array::new_with_length(samples.len() as u32);
+    int16_array.copy_from(&samples);
+    Ok(object(&[
+        ("sampleRate", sample_rate.into()),
+        ("channelCount", channel_count.into()),
+        (
+            "loopSampleIndex",
+            if loop_sample > start_sample {
+                (((loop_sample - start_sample) * 14 / 16) as f64).into()
+            } else {
+                JsValue::NULL
+            },
+        ),
+        ("samples", int16_array.into()),
+    ]))
+}
+
+/// Get the number of sound clips inside a Nintendo GameCube .ssm audio bank.
+#[wasm_bindgen]
+pub fn decode_ssm_count(bytes: &[u8]) -> u32 {
+    if bytes.len() < 12 {
+        return 0;
+    }
+    u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
+}

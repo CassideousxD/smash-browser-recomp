@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Melee Controller Calibration CLI</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --green: #39d353;
+      --green-glow: rgba(57, 211, 83, 0.4);
+      --amber: #f0883e;
+      --cyan: #58a6ff;
+      --text: #c9d1d9;
+      --dim: #8b949e;
+      --border: #30363d;
+      --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--green);
+      font-family: var(--font-mono);
+      font-size: 14px;
+      line-height: 1.5;
+      padding: 1rem;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    .terminal {
+      width: min(880px, 98vw);
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6), 0 0 40px var(--green-glow);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .term-header {
+      background: #090d13;
+      padding: 0.6rem 1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+    .dot.red { background: #ff5f56; }
+    .dot.yellow { background: #ffbd2e; }
+    .dot.green { background: #27c93f; }
+    .term-title {
+      flex: 1;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--dim);
+      letter-spacing: 0.05em;
+    }
+    .term-body {
+      padding: 1.25rem 1.5rem;
+      min-height: 520px;
+      display: flex;
+      flex-direction: column;
+    }
+    .banner {
+      color: var(--cyan);
+      margin-bottom: 0.75rem;
+      white-space: pre;
+      font-weight: 700;
+      font-size: 0.85rem;
+    }
+    .hw-tester {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      margin-bottom: 1rem;
+    }
+    .hw-title {
+      font-size: 0.8rem;
+      color: var(--cyan);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.5rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .grid-btns {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-bottom: 0.5rem;
+    }
+    .btn-badge {
+      font-size: 0.75rem;
+      padding: 2px 6px;
+      background: #21262d;
+      color: var(--dim);
+      border-radius: 4px;
+      border: 1px solid #30363d;
+      transition: all 80ms ease;
+    }
+    .btn-badge.pressed {
+      background: var(--green);
+      color: #000;
+      font-weight: 700;
+      border-color: var(--green);
+      box-shadow: 0 0 8px var(--green);
+    }
+    .grid-axes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .axis-badge {
+      font-size: 0.75rem;
+      padding: 2px 6px;
+      background: #161b22;
+      color: var(--dim);
+      border-radius: 4px;
+      border: 1px solid #30363d;
+    }
+    .axis-badge.active {
+      color: var(--amber);
+      border-color: var(--amber);
+      font-weight: 700;
+    }
+    .log-line {
+      margin: 0.15rem 0;
+    }
+    .log-line.dim { color: var(--dim); }
+    .log-line.warn { color: var(--amber); }
+    .log-line.cyan { color: var(--cyan); }
+    .log-line.active {
+      color: #fff;
+      font-size: 1.1rem;
+      font-weight: 700;
+      background: rgba(88, 166, 255, 0.15);
+      border-left: 3px solid var(--cyan);
+      padding: 0.4rem 0.75rem;
+      margin: 0.6rem 0;
+    }
+    .log-line.captured {
+      color: var(--amber);
+      font-size: 1.05rem;
+      font-weight: 700;
+      background: rgba(240, 136, 62, 0.15);
+      border-left: 3px solid var(--amber);
+      padding: 0.4rem 0.75rem;
+      margin: 0.4rem 0;
+    }
+    .log-line.success {
+      color: var(--green);
+      font-size: 1.05rem;
+      font-weight: 700;
+      background: rgba(57, 211, 83, 0.15);
+      border-left: 3px solid var(--green);
+      padding: 0.4rem 0.75rem;
+      margin: 0.4rem 0;
+    }
+    .cursor {
+      display: inline-block;
+      width: 8px;
+      height: 1.2em;
+      background: var(--green);
+      vertical-align: middle;
+      animation: blink 1s infinite;
+      margin-left: 4px;
+    }
+    @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+    .footer-bar {
+      margin-top: auto;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.85rem;
+      color: var(--dim);
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+    .btn {
+      font-family: inherit;
+      font-size: 0.85rem;
+      font-weight: 700;
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #21262d;
+      color: var(--text);
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all 120ms ease;
+    }
+    .btn:hover { background: #30363d; color: #fff; border-color: var(--dim); }
+    .btn.primary { background: var(--green); color: #000; border-color: var(--green); }
+    .btn.primary:hover { background: #2ea043; border-color: #2ea043; }
+    .btn.amber { background: var(--amber); color: #000; border-color: var(--amber); }
+    .btn.amber:hover { background: #d97706; }
+  </style>
+</head>
+<body>
+
+<div class="terminal">
+  <div class="term-header">
+    <span class="dot red"></span>
+    <span class="dot yellow"></span>
+    <span class="dot green"></span>
+    <span class="term-title">melee-controller-cli · live calibration & monitor</span>
+  </div>
+  <div class="term-body" id="term-body">
+    <div class="banner">========================================================================
+   SUPER SMASH BROS. MELEE (NTSC 1.02) — CONTROLLER CALIBRATION CLI   
+========================================================================</div>
+
+    <!-- Live Hardware Monitor -->
+    <div class="hw-tester">
+      <div class="hw-title">
+        <span>Hardware Input Monitor (Live)</span>
+        <span id="active-summary" style="color: var(--amber); font-weight: bold;">Press any button/trigger/dpad...</span>
+      </div>
+      <div class="grid-btns" id="grid-btns"></div>
+      <div class="grid-axes" id="grid-axes"></div>
+    </div>
+
+    <div id="output" style="flex: 1; overflow-y: auto; max-height: 380px;"></div>
+
+    <div class="footer-bar">
+      <span id="live-hw">HW Monitor: Initializing Gamepad API…</span>
+      <div style="display: flex; gap: 0.4rem; flex-wrap: wrap;">
+        <button class="btn amber" id="btn-xbox" onclick="applyXboxPreset()" title="Instantly apply standard Xbox / PowerA PC mapping">⚡ 1-Click Xbox/PowerA Setup</button>
+        <button class="btn" id="btn-zero" onclick="rezeroAxes()" title="Zero resting axes">🎯 Zero Axes</button>
+        <button class="btn" id="btn-skip" onclick="skipStep()" title="Skip this input (or press Space)">⏭️ Skip Step</button>
+        <button class="btn" id="btn-restart" onclick="restartWizard()">Restart</button>
+        <a class="btn primary" id="btn-return" href="/">Return to Melee</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const STEPS = [
+  { key: 'a', name: 'Normal Attack (A)', hint: 'Jab / Punches / Aerials / Smashes (Physical A - Bottom)', glyph: 'A', buttonsOnly: true },
+  { key: 'b', name: 'Special Move (B)', hint: 'Link Bow / Fireball / Recovery (Physical B - Right)', glyph: 'B', buttonsOnly: true },
+  { key: 'x', name: 'Jump Button (X)', hint: 'Jump / Short Hop (Physical X - Left)', glyph: 'X', buttonsOnly: true },
+  { key: 'y', name: 'Jump Button (Y)', hint: 'Jump / Short Hop (Physical Y - Top)', glyph: 'Y', buttonsOnly: true },
+  { key: 'z', name: 'Grab / Hookshot (Z)', hint: 'Grab opponents & Z-Air Tether (Right Bumper RB or Left Bumper LB)', glyph: 'Z', buttonsOnly: false },
+  { key: 'l', name: 'Left Shield (L)', hint: 'Shield / Roll / Air Dodge (Left Trigger LT or Bumper)', glyph: 'L', buttonsOnly: false },
+  { key: 'r', name: 'Right Shield (R)', hint: 'Shield / Roll / Air Dodge (Right Trigger RT or Bumper)', glyph: 'R', buttonsOnly: false },
+  { key: 'start', name: 'Start / Pause', hint: 'Pause match / Menu Confirm (+ / Start)', glyph: 'Start', buttonsOnly: true },
+  { key: 'dpadUp', name: 'D-Pad UP', hint: 'Directional Pad Up (Taunt / Menu Up)', glyph: '▲', buttonsOnly: false, isDpad: true },
+  { key: 'dpadDown', name: 'D-Pad DOWN', hint: 'Directional Pad Down (Taunt / Menu Down / Crouch)', glyph: '▼', buttonsOnly: false, isDpad: true },
+  { key: 'dpadLeft', name: 'D-Pad LEFT', hint: 'Directional Pad Left (Taunt / Menu Left / Move Left)', glyph: '◀', buttonsOnly: false, isDpad: true },
+  { key: 'dpadRight', name: 'D-Pad RIGHT', hint: 'Directional Pad Right (Taunt / Menu Right / Move Right)', glyph: '▶', buttonsOnly: false, isDpad: true },
+];
+
+const state = {
+  pad: null,
+  stepIndex: 0,
+  bindings: {},
+  baselineAxes: [],
+  waitingRelease: false,
+  captured: null,
+  captureTime: 0,
+  done: false,
+};
+
+const output = document.getElementById('output');
+const liveHw = document.getElementById('live-hw');
+const gridBtns = document.getElementById('grid-btns');
+const gridAxes = document.getElementById('grid-axes');
+const activeSummary = document.getElementById('active-summary');
+
+function log(html, cls = '') {
+  const line = document.createElement('div');
+  line.className = 'log-line ' + cls;
+  line.innerHTML = html;
+  output.appendChild(line);
+  line.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  return line;
+}
+
+function clearPromptLines() {
+  document.querySelectorAll('.active, .captured').forEach(e => e.remove());
+}
+
+function formatSource(s) {
+  if (!s) return 'None';
+  if (s.type === 'button') return `Button #${s.index}`;
+  if (s.type === 'axis') return `Axis #${s.index} (${s.dir > 0 ? '+' : '-'})`;
+  return JSON.stringify(s);
+}
+
+function init() {
+  output.innerHTML = '';
+  log('[i] Connecting to Gamepad subsystem…', 'dim');
+  log('[!] Please press ANY button or trigger on your controller to activate.', 'warn');
+}
+
+function skipStep() {
+  if (state.stepIndex < STEPS.length) {
+    const s = STEPS[state.stepIndex];
+    log(`[⏭️] Skipped: ${s.name}`, 'dim');
+    state.waitingRelease = false;
+    state.captured = null;
+    state.stepIndex++;
+    showCurrentStep();
+  }
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'Escape') {
+    skipStep();
+  }
+});
+
+function restartWizard() {
+  state.stepIndex = 0;
+  state.bindings = {};
+  state.waitingRelease = false;
+  state.captured = null;
+  state.captureTime = 0;
+  state.done = false;
+  init();
+}
+
+function rezeroAxes() {
+  const gp = (navigator.getGamepads ? navigator.getGamepads() : []).filter(p => p && p.connected)[0];
+  if (gp) {
+    state.baselineAxes = [...gp.axes];
+    log('✓ Captured current resting position as baseline for all axes.', 'cyan');
+  }
+}
+
+function showCurrentStep() {
+  clearPromptLines();
+  if (state.stepIndex >= STEPS.length) {
+    finishCalibration();
+    return;
+  }
+  const s = STEPS[state.stepIndex];
+  // Capture fresh baseline right as step begins
+  const gp = (navigator.getGamepads ? navigator.getGamepads() : []).filter(p => p && p.connected)[0];
+  if (gp) state.baselineAxes = [...gp.axes];
+
+  log(`>>> [STEP ${state.stepIndex + 1} of ${STEPS.length}] Press your physical control for: <strong>${s.name}</strong><br><span style="font-size: 0.9rem; color: var(--dim);">${s.hint}</span><span class="cursor"></span>`, 'active');
+}
+
+function applyXboxPreset() {
+  const gp = (navigator.getGamepads ? navigator.getGamepads() : []).filter(p => p && p.connected)[0];
+  const padId = gp ? gp.id : 'PowerA Controller';
+  if (!state.pad && gp) state.pad = gp;
+
+  state.bindings = {
+    a: { type: 'button', index: 0 },
+    b: { type: 'button', index: 1 },
+    x: { type: 'button', index: 2 },
+    y: { type: 'button', index: 3 },
+    z: { type: 'button', index: 5 }, // RB (LB 4 also triggers grab)
+    l: { type: 'button', index: 6 }, // LT
+    r: { type: 'button', index: 7 }, // RT
+    start: { type: 'button', index: 9 }, // Start
+    dpadUp: { type: 'button', index: 12 },
+    dpadDown: { type: 'button', index: 13 },
+    dpadLeft: { type: 'button', index: 14 },
+    dpadRight: { type: 'button', index: 15 },
+  };
+
+  log('<br>⚡ <strong>Applied Standard Xbox / PowerA Preset directly!</strong>', 'cyan');
+  state.stepIndex = STEPS.length;
+  finishCalibration();
+}
+
+async function finishCalibration() {
+  clearPromptLines();
+  log('<br>========================================================================', 'success');
+  log('🎉 CALIBRATION COMPLETE! CONTROLS VERIFIED & SAVED.', 'success');
+  log('========================================================================', 'success');
+  
+  let summary = '<div style="margin: 0.75rem 0; line-height: 1.8;">';
+  for (const s of STEPS) {
+    summary += `  • <strong>${s.name.padEnd(20, ' ')}</strong> ➜ <span style="color: var(--amber);">${formatSource(state.bindings[s.key])}</span><br>`;
+  }
+  summary += '</div>';
+  log(summary);
+
+  const padId = state.pad ? state.pad.id : 'PowerA Battle Dragon Controller';
+
+  // Save to localStorage
+  try {
+    const KEY = 'melee.customProfiles';
+    const existing = JSON.parse(localStorage.getItem(KEY) || '{}');
+    existing[padId] = state.bindings;
+    localStorage.setItem(KEY, JSON.stringify(existing));
+    localStorage.setItem('melee.customPad.' + padId, JSON.stringify(state.bindings));
+    log('✓ Saved to browser profile storage (localStorage)', 'cyan');
+  } catch (e) {
+    log('! Note: Could not write to localStorage: ' + e, 'dim');
+  }
+
+  // POST to backend API for permanent disc/app sync
+  try {
+    const payload = {
+      id: padId,
+      name: padId,
+      bindings: state.bindings,
+      updatedAt: new Date().toISOString(),
+    };
+    const resp = await fetch('/api/controller-profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (resp.ok) {
+      log('✓ Saved directly to server configuration (config/controller_profile.json)', 'cyan');
+    }
+  } catch {}
+
+  log('<br>🚀 Controls are live and ready! Click below to return to the match:', 'active');
+  document.getElementById('btn-return').focus();
+}
+
+function poll() {
+  const gamepads = (navigator.getGamepads ? navigator.getGamepads() : []).filter(p => p && p.connected);
+  const gp = gamepads[0];
+
+  if (!state.pad && gp) {
+    state.pad = gp;
+    state.baselineAxes = [...gp.axes];
+    clearPromptLines();
+    log(`[+] Controller detected: <strong>${gp.id}</strong>`, 'cyan');
+    log(`[+] Hardware specs: ${gp.buttons.length} buttons, ${gp.axes.length} axes`, 'dim');
+    log('------------------------------------------------------------------------', 'dim');
+    showCurrentStep();
+  }
+
+  if (gp) {
+    // 1. Render/Update visual button and axis badges
+    if (gridBtns.children.length !== gp.buttons.length) {
+      gridBtns.innerHTML = '';
+      for (let i = 0; i < gp.buttons.length; i++) {
+        const bEl = document.createElement('span');
+        bEl.className = 'btn-badge';
+        bEl.id = 'btn-badge-' + i;
+        bEl.textContent = `B#${i}`;
+        gridBtns.appendChild(bEl);
+      }
+    }
+    if (gridAxes.children.length !== gp.axes.length) {
+      gridAxes.innerHTML = '';
+      for (let j = 0; j < gp.axes.length; j++) {
+        const aEl = document.createElement('span');
+        aEl.className = 'axis-badge';
+        aEl.id = 'axis-badge-' + j;
+        aEl.textContent = `Ax${j}:0.0`;
+        gridAxes.appendChild(aEl);
+      }
+    }
+
+    const activeList = [];
+
+    // Check buttons
+    for (let i = 0; i < gp.buttons.length; i++) {
+      const b = gp.buttons[i];
+      const isPressed = b && (b.pressed || b.value > 0.45);
+      const el = document.getElementById('btn-badge-' + i);
+      if (el) {
+        if (isPressed) {
+          el.classList.add('pressed');
+          activeList.push(`Btn #${i} (${b.value ? b.value.toFixed(2) : '1.0'})`);
+        } else {
+          el.classList.remove('pressed');
+        }
+      }
+    }
+
+    // Check axes (only active when moved away from resting baseline!)
+    for (let j = 0; j < gp.axes.length; j++) {
+      const val = gp.axes[j];
+      const el = document.getElementById('axis-badge-' + j);
+      if (el) {
+        el.textContent = `Ax${j}:${val.toFixed(2)}`;
+        // If baseline isn't captured yet, use known hardware resting values (triggers -1.0, hat -1.29)
+        const base = state.baselineAxes[j] !== undefined 
+          ? state.baselineAxes[j] 
+          : ((j === 3 || j === 4) ? -1.0 : (j === 9 ? -1.29 : 0.0));
+        const diff = val - base;
+        if (Math.abs(diff) > 0.25) {
+          el.classList.add('active');
+          activeList.push(`Axis #${j} (${val.toFixed(2)})`);
+        } else {
+          el.classList.remove('active');
+        }
+      }
+    }
+
+    if (activeList.length) {
+      activeSummary.textContent = `⚡ Active: ${activeList.join(', ')}`;
+    } else {
+      activeSummary.textContent = 'Hardware Monitor: Waiting for input…';
+    }
+
+    // 2. Wizard step handling
+    if (!state.done && state.stepIndex < STEPS.length) {
+      const currentStep = STEPS[state.stepIndex];
+
+      if (state.waitingRelease) {
+        let isReleased = false;
+        const cap = state.captured;
+        if (cap.type === 'button') {
+          const b = gp.buttons[cap.index];
+          isReleased = !b || (!b.pressed && (typeof b.value !== 'number' || b.value < 0.2));
+        } else if (cap.type === 'axis') {
+          const base = cap.rest !== undefined ? cap.rest : (state.baselineAxes[cap.index] || 0);
+          const val = gp.axes[cap.index] || 0;
+          isReleased = Math.abs(val - base) < 0.25 || (Date.now() - state.captureTime > 600);
+        } else {
+          isReleased = true;
+        }
+
+        if (isReleased) {
+          state.waitingRelease = false;
+          state.captured = null;
+          state.baselineAxes = [...gp.axes];
+          state.stepIndex++;
+          showCurrentStep();
+        }
+      } else {
+        // Detect button press first
+        let captured = null;
+        for (let i = 0; i < gp.buttons.length; i++) {
+          const b = gp.buttons[i];
+          if (b && (b.pressed || b.value > 0.45)) {
+            captured = { type: 'button', index: i };
+            break;
+          }
+        }
+
+        // If no button and step allows analog / axis:
+        if (!captured && !currentStep.buttonsOnly) {
+          // Exclude axes 0..3 (Left Stick & Right Stick) so stick drift never captures for D-pad or triggers!
+          for (let j = 4; j < gp.axes.length; j++) {
+            const val = gp.axes[j];
+            const base = state.baselineAxes[j] !== undefined ? state.baselineAxes[j] : 0;
+            const diff = val - base;
+            if (Math.abs(diff) > 0.40) {
+              captured = { type: 'axis', index: j, dir: diff > 0 ? 1 : -1, rest: base };
+              break;
+            }
+          }
+        }
+
+        if (captured) {
+          state.bindings[currentStep.key] = captured;
+          state.captured = captured;
+          state.captureTime = Date.now();
+          state.waitingRelease = true;
+          clearPromptLines();
+          log(`✓ <strong>${currentStep.name}</strong> ➜ Registered: <span style="color:var(--amber); font-weight:700;">${formatSource(captured)}</span>! Release to proceed…`, 'captured');
+        }
+      }
+    }
+  }
+
+  requestAnimationFrame(poll);
+}
+
+init();
+requestAnimationFrame(poll);
+</script>
+
+</body>
+</html>

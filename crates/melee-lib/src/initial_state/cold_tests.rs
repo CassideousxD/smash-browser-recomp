@@ -1,0 +1,537 @@
+use super::*;
+use crate::{scene_fighter::with_fighter, scene_stage::SceneStage};
+use melee_types::snapshot::SnapshotSink;
+
+fn setup_snapshot(state: &InitialState) -> Record {
+    let mut output = RecordSink::new(0, "setup");
+    let sink: &mut dyn SnapshotSink = &mut output;
+    state.snapshot(sink);
+    for (p, fighter) in state.fighters.iter().enumerate() {
+        let name = format!("p{p}");
+        let mut prefix = PrefixSink::new(sink, &name);
+        let sink: &mut dyn SnapshotSink = &mut prefix;
+        with_fighter!(fighter, |f| {
+            sink.field("cpu.attack_delay", &f.cpu.attack_delay);
+            // A transforming character's other form starts asleep (Sleep).
+            if f.motion_state.id == melee_types::CommonMotionState::Sleep {
+                sink.field("sleep", &1u8);
+            } else {
+                let melee_ft::fighter::MotionData::Entry(entry) = &f.state_data else {
+                    panic!("match-start fighter must be in Entry");
+                };
+                sink.field("entry.timer", &entry.timer);
+                sink.field("entry.origin_y", &entry.origin_y);
+                sink.field("entry.original_scale", &entry.original_scale);
+                sink.field("entry.current_scale", &entry.current_scale);
+                sink.field("entry.ecb.top", &entry.collision_box.top);
+                sink.field("entry.ecb.bottom", &entry.collision_box.bottom);
+                sink.field("entry.ecb.left.x", &entry.collision_box.left.x);
+                sink.field("entry.ecb.left.y", &entry.collision_box.left.y);
+                sink.field("entry.ecb.right.x", &entry.collision_box.right.x);
+                sink.field("entry.ecb.right.y", &entry.collision_box.right.y);
+            }
+        });
+    }
+    match &state.stage {
+        SceneStage::FinalDestination(stage) => stage.ground.snapshot(sink),
+        SceneStage::Battlefield(stage) => {
+            sink.field("stage.phase", &(stage.phase as u8));
+            sink.field("stage.timer", &stage.timer);
+            sink.field("stage.current", &stage.current.map(i32::from).unwrap_or(-1));
+            sink.field(
+                "stage.previous",
+                &stage.previous.map(i32::from).unwrap_or(-1),
+            );
+            sink.field("stage.light_count", &(stage.lights.len() as u32));
+            for (i, light) in stage.lights.iter().enumerate() {
+                let name = format!("stage.light[{i}]");
+                let mut prefix = PrefixSink::new(sink, &name);
+                let sink: &mut dyn SnapshotSink = &mut prefix;
+                use melee_gr::battle::lights::Light;
+                let color = match light {
+                    Light::Point { .. } => unreachable!("Battlefield uses directional light"),
+                    Light::Ambient { color } => {
+                        sink.field("kind", &0u8);
+                        color
+                    }
+                    Light::Directional {
+                        color,
+                        position,
+                        shininess,
+                    } => {
+                        sink.field("kind", &1u8);
+                        sink.field("position", position);
+                        sink.field("shininess", shininess);
+                        color
+                    }
+                };
+                for (component, value) in color.iter().enumerate() {
+                    sink.field(&format!("color[{component}]"), value);
+                }
+            }
+        }
+        SceneStage::Pupupu(stage) => {
+            sink.field("stage.phase", &(stage.phase as u8));
+            sink.field("stage.cycle", &stage.cycle);
+            sink.field("stage.timer", &stage.timer);
+            sink.field("stage.blink_timer", &stage.blink_timer);
+            sink.field("stage.entering", &stage.entering);
+            sink.field("stage.facing_right", &stage.facing_right);
+            sink.field("stage.elapsed", &stage.elapsed);
+            sink.field("stage.background_timer", &stage.background_timer);
+            // xDC (wind) is inactive heap storage until the first map-7 proc.
+        }
+        SceneStage::Izumi(stage) => {
+            for (side, platform) in stage.platforms.iter().enumerate() {
+                let name = format!("stage.platform[{side}]");
+                let mut prefix = PrefixSink::new(sink, &name);
+                let sink: &mut dyn SnapshotSink = &mut prefix;
+                sink.field("phase", &(platform.phase as u8));
+                sink.field("timer", &i32::from(platform.timer));
+                sink.field("collision_joint", &i32::from(platform.collision_joint));
+                sink.field("height", &platform.height);
+                sink.field("target", &platform.target);
+                sink.field("full_height", &platform.full_height);
+                sink.field("rest_height", &platform.rest_height);
+                sink.field("origin_y", &platform.origin_y);
+            }
+        }
+        SceneStage::OldYoshi(stage) => {
+            for (index, cloud) in stage.clouds.iter().enumerate() {
+                let name = format!("stage.cloud[{index}]");
+                let mut prefix = PrefixSink::new(sink, &name);
+                let sink: &mut dyn SnapshotSink = &mut prefix;
+                sink.field("phase", &(cloud.phase as u8));
+                sink.field("counter", &cloud.counter);
+                sink.field("rest_y", &cloud.rest_y);
+                sink.field("depth", &cloud.depth);
+                sink.field("speed", &cloud.speed);
+            }
+            sink.field("stage.guest.timer", &stage.guest.timer);
+            sink.field("stage.guest.shown", &stage.guest.shown);
+        }
+        SceneStage::OldKongo(stage) => {
+            let barrel = &stage.barrel;
+            sink.field("stage.barrel.turn", &(barrel.turn as u8));
+            sink.field("stage.barrel.catch", &(barrel.catch as u8));
+            sink.field("stage.barrel.drift", &(barrel.drift as u8));
+            sink.field("stage.barrel.turn_timer", &barrel.turn_timer);
+            sink.field("stage.barrel.drift_timer", &barrel.drift_timer);
+            sink.field("stage.barrel.aim", &barrel.aim);
+            sink.field("stage.barrel.target_aim", &barrel.target_aim);
+            sink.field("stage.barrel.spin", &barrel.spin);
+            sink.field("stage.barrel.speed", &barrel.speed);
+            sink.field("stage.bird.timer", &stage.bird.timer);
+            sink.field("stage.cannon", &stage.cannon);
+            sink.field("stage.catch_enabled", &stage.catch_enabled);
+        }
+        SceneStage::Garden(stage) => {
+            sink.field("stage.cranky.animation", &stage.cranky.animation);
+            sink.field("stage.cranky.loops_left", &stage.cranky.loops_left);
+            sink.field("stage.klaptrap.leaping", &stage.klaptrap.leaping);
+            sink.field("stage.klaptrap.timer", &stage.klaptrap.timer);
+            sink.field("stage.water_active", &stage.water_active);
+        }
+        SceneStage::Kongo(stage) => {
+            for (i, plank) in stage.bridge.planks.iter().enumerate() {
+                sink.field(&format!("stage.plank[{i}].angle"), &plank.angle);
+                sink.field(&format!("stage.plank[{i}].velocity"), &plank.velocity);
+                sink.field(&format!("stage.plank[{i}].sag"), &plank.sag);
+            }
+            for (i, swing) in stage.swings.iter().enumerate() {
+                sink.field(&format!("stage.swing[{i}].angle"), &swing.angle);
+                sink.field(&format!("stage.swing[{i}].velocity"), &swing.velocity);
+            }
+            sink.field("stage.event_timer", &stage.event_timer);
+            sink.field("stage.last_event", &stage.last_event);
+            let barrel = &stage.barrel;
+            sink.field("stage.barrel.spin", &(barrel.spin as u8));
+            sink.field("stage.barrel.rate_phase", &barrel.rate_phase);
+            sink.field("stage.barrel.spin_timer", &barrel.spin_timer);
+            sink.field("stage.barrel.rate_timer", &barrel.rate_timer);
+            sink.field("stage.barrel.angle", &barrel.angle);
+            sink.field("stage.barrel.speed", &barrel.speed);
+            sink.field("stage.barrel.rate", &barrel.rate);
+            sink.field("stage.barrel_position.x", &stage.barrel_position.x);
+            sink.field("stage.barrel_position.y", &stage.barrel_position.y);
+        }
+        SceneStage::Shrine(_) => {}
+        SceneStage::Onett(stage) => {
+            sink.field("stage.onett.smoke_timer", &stage.smoke.timer);
+        }
+        SceneStage::Zebes(stage) => {
+            sink.field("stage.zebes.ornament_timer", &stage.ornament.timer);
+            sink.field("stage.zebes.acid_timer", &stage.acid.timer);
+            sink.field("stage.zebes.acid_level", &stage.acid.level);
+            sink.field("stage.zebes.floor", &stage.floor);
+            sink.field("stage.zebes.pulse_timer", &stage.island.pulse_timer);
+            for (i, bubble) in stage.bubbles.entries.iter().enumerate() {
+                sink.field(&format!("stage.zebes.bubble[{i}].state"), &(bubble.state as u8));
+                sink.field(&format!("stage.zebes.bubble[{i}].x"), &bubble.x);
+                sink.field(&format!("stage.zebes.bubble[{i}].y"), &bubble.y);
+                sink.field(&format!("stage.zebes.bubble[{i}].size"), &bubble.size);
+            }
+        }
+        SceneStage::Venom(stage) => {
+            sink.field("stage.venom.wait", &stage.spawner.wait);
+            sink.field("stage.venom.frame", &stage.sequence.frame);
+        }
+        SceneStage::MuteCity(stage) => {
+            sink.field("stage.mutecity.script", &i32::from(stage.script.entry));
+        }
+        SceneStage::Pura(stage) => {
+            sink.field("stage.pura.sky_from", &i32::from(stage.sky.from));
+            sink.field("stage.pura.sky_to", &i32::from(stage.sky.to));
+        }
+        SceneStage::GreatBay(stage) => {
+            sink.field("stage.greatbay.turtle_timer", &stage.turtle.timer);
+            sink.field("stage.greatbay.moon_timer", &stage.moon.timer);
+        }
+        SceneStage::Inishie2(stage) => {
+            sink.field("stage.inishie2.birdo_wait", &stage.controller.birdo.ticks);
+        }
+        SceneStage::IceMt(stage) => {
+            sink.field("stage.icemt.under", &stage.controller.under);
+            sink.field("stage.icemt.upper", &stage.controller.upper);
+        }
+        SceneStage::Castle(stage) => {
+            sink.field("stage.castle.platform_y", &stage.platforms[0].position);
+        }
+        SceneStage::RCruise(stage) => {
+            sink.field("stage.rcruise.scroll_x", &stage.scroll.x);
+        }
+        SceneStage::Greens(greens) => {
+            sink.field("stage.greens.block_timer", &greens.stage.blocks.timer);
+        }
+        SceneStage::BigBlue(stage) => {
+            sink.field("stage.bigblue.arrival_timer", &i32::from(stage.cars.arrival_timer));
+            for (i, lane) in stage.cars.lanes.iter().enumerate() {
+                sink.field(&format!("stage.bigblue.lane[{i}].slot"), &(lane.slot as u32));
+                sink.field(&format!("stage.bigblue.lane[{i}].phase"), &lane.phase);
+                sink.field(&format!("stage.bigblue.lane[{i}].wait"), &lane.wait);
+            }
+        }
+        SceneStage::Inishie1(stage) => {
+            sink.field("stage.inishie1.lift_base", &stage.lifts.base_y);
+        }
+        SceneStage::Yorster(stage) => {
+            sink.field("stage.yorster.waiting", &u32::from(stage.waiting));
+        }
+        SceneStage::Kraid(stage) => {
+            sink.field("stage.kraid.timer", &stage.kraid.timer);
+            sink.field("stage.kraid.leftmost", &stage.kraid.leftmost);
+            sink.field("stage.kraid.rightmost", &stage.kraid.rightmost);
+        }
+        SceneStage::Fourside(stage) => {
+            sink.field("stage.crane.timer", &stage.crane.timer);
+            sink.field("stage.crane.y", &stage.crane.y);
+            sink.field("stage.heli.timer", &stage.heli.timer);
+            sink.field("stage.ufo.timer", &stage.ufo.timer);
+        }
+        SceneStage::FlatZone(stage) => {
+            let c = &stage.controller;
+            sink.field("stage.controller.waiting", &c.waiting);
+            sink.field("stage.controller.ready", &c.ready);
+            sink.field("stage.controller.timer", &c.timer);
+            let p = &stage.platforms;
+            sink.field("stage.platforms.waiting", &p.waiting);
+            sink.field("stage.platforms.animation", &p.animation);
+            sink.field("stage.platforms.stitched", &p.stitched);
+            sink.field("stage.platforms.layout", &p.layout);
+            sink.field("stage.platforms.variant", &p.variant);
+            sink.field("stage.platforms.timer", &p.timer);
+            sink.field("stage.oil.timer", &stage.oil.timer);
+            sink.field("stage.tools.frames", &stage.tools.frames);
+        }
+        SceneStage::Story(stage) => {
+            sink.field("stage.puff_timer", &stage.puff_timer);
+            sink.field("stage.shy_timer", &stage.shy_timer);
+            sink.field("stage.previous_pattern", &stage.previous_pattern);
+            sink.field("stage.spawn_count", &stage.spawn_count);
+        }
+        SceneStage::Stadium(stage) => {
+            let screen = &stage.screen;
+            sink.field("stage.screen.mode", &(screen.mode as u8));
+            sink.field(
+                "stage.screen.previous",
+                &screen.previous.map_or(-1, |m| m as i32),
+            );
+            sink.field("stage.screen.timer", &screen.timer);
+            sink.field("stage.screen.focus", &screen.focus);
+            sink.field("stage.screen.cycles", &screen.cycles);
+            sink.field(
+                "stage.screen.subject",
+                &screen.subject.as_ref().map_or(-1, |s| s.state as i32),
+            );
+            let controller = &stage.transformation;
+            sink.field("stage.waiting_for_start", &controller.waiting_for_start);
+            sink.field("stage.phase", &(controller.phase as u8));
+            sink.field("stage.timer", &controller.timer);
+            sink.field("stage.form", &controller.form.map());
+            sink.field(
+                "stage.previous",
+                &controller.previous.map_or(-1, |f| i32::from(f.map())),
+            );
+        }
+    }
+    // lb_804D63B0 / lb_804D63B4: Hyrule Temple's field outlives creation.
+    sink.field("dynamics.fields", &(state.radial_forces.fields().len() as u32));
+    sink.field("dynamics.wind", &state.radial_forces.wind_state().code());
+    sink.field("scheduler.resume_s_link", &state.resume.s_link);
+    output.finish()
+}
+
+fn verify(name: &str) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let cold = Scenario::load(&root.join(format!("harness/scenarios/{name}_cold.toml"))).unwrap();
+    let saved = Scenario::load(&root.join(format!("harness/scenarios/{name}.toml"))).unwrap();
+    if !melee_test_support::require_files(
+        cold.required_files()
+            .iter()
+            .chain(saved.required_files().iter()),
+    ) {
+        return;
+    }
+    let constructed = InitialState::from_parameters(&cold).unwrap();
+    let imported = InitialState::from_savestate_traces(&saved).unwrap();
+    let actual = setup_snapshot(&constructed);
+    let expected = setup_snapshot(&imported);
+    if let Some(diff) = first_divergence([&expected], [&actual]) {
+        panic!("{name} initial snapshot: {diff}");
+    }
+    assert_eq!(actual.state.len(), expected.state.len());
+    eprintln!("{name}: {} initial scene fields match", actual.state.len());
+    let banks = BTreeMap::from([
+        (0, constructed.assets.common_particle_bank.clone()),
+        (30, constructed.assets.particle_bank.clone()),
+    ]);
+    particles::assert_state(
+        &particles::snapshot(&imported.particles, imported.rng.seed, 0, &banks),
+        &particles::snapshot(&constructed.particles, constructed.rng.seed, 0, &banks),
+    );
+    // Attachment matrices live in capture metadata, outside the particle
+    // Snapshot fields. Compare their bits too; never supply them to setup.
+    for (actual, expected) in constructed
+        .particles
+        .generators
+        .iter()
+        .zip(&imported.particles.generators)
+    {
+        let words = |matrix: Option<Mtx>| matrix.map(|m| m.0.map(|row| row.map(f32::to_bits)));
+        assert_eq!(
+            words(actual.joint_matrix),
+            words(expected.joint_matrix),
+            "{name} generator attachment"
+        );
+        assert_eq!(actual.attachment_id, expected.attachment_id);
+    }
+    crate::trace::gate(&cold).unwrap();
+}
+use std::collections::BTreeMap;
+
+#[test]
+fn start_fd_fox_cold_600() {
+    verify("start_fd_fox");
+}
+#[test]
+fn start_fd_marth_cold_600() {
+    verify("start_fd_marth");
+}
+#[test]
+fn start_fd_falco_cold_600() {
+    verify("start_fd_falco");
+}
+/// Every match-start boundary in `harness/boundaries.toml` (the explorer's
+/// starting points; `make_boundary.py` registers new ones). Sudden Death's
+/// boundary starts mid-mode and is gated in `m5_gate`.
+#[test]
+fn registered_boundaries_cold_600() {
+    #[derive(serde::Deserialize)]
+    struct Registry {
+        boundary: Vec<Boundary>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Boundary {
+        name: String,
+        #[serde(default)]
+        sudden_death: bool,
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join("harness/boundaries.toml")).unwrap();
+    let registry: Registry = toml::from_str(&text).unwrap();
+    for boundary in registry.boundary.iter().filter(|b| !b.sudden_death) {
+        verify(&boundary.name);
+    }
+}
+#[test]
+fn start_bf_fox_cold_600() {
+    verify("start_bf_fox");
+}
+
+/// Construction and `run` must work when the root has DAT assets only:
+/// neither a comparison trace nor any saved-boundary capture can be read.
+#[cfg(unix)]
+#[test]
+fn cold_run_reads_only_dat_assets() {
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("remove test scratch directory");
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let assets = root.join("harness/roms/files");
+    if !melee_test_support::require_files([assets.join("PlCo.dat")]) {
+        return;
+    }
+    let scratch = Scratch(std::env::temp_dir().join(format!(
+        "melee-cold-assets-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+    )));
+    std::fs::create_dir_all(scratch.0.join("harness/roms")).unwrap();
+    std::os::unix::fs::symlink(
+        assets.canonicalize().unwrap(),
+        scratch.0.join("harness/roms/files"),
+    )
+    .unwrap();
+    for name in [
+        "start_fd_fox",
+        "start_fd_marth",
+        "start_fd_falco",
+        "start_bf_fox",
+        "start_ys_fox",
+        "start_dl_fox",
+        "start_fod_fox_marth4",
+    ] {
+        let mut scenario =
+            Scenario::load(&root.join(format!("harness/scenarios/{name}_cold.toml"))).unwrap();
+        if !melee_test_support::require_files(
+            scenario
+                .required_files()
+                .iter()
+                .filter(|p| p.starts_with(scenario.assets_path())),
+        ) {
+            continue;
+        }
+        scenario.root = scratch.0.clone();
+        assert!(!scenario.expected_path().exists());
+        assert!(!scenario.root.join("harness/traces").exists());
+        crate::trace::write_run(&scenario, std::io::sink()).unwrap();
+    }
+}
+
+#[test]
+fn start_kj_fox_marth4_cold_600() {
+    verify("start_kj_fox_marth4");
+}
+
+#[test]
+fn start_bd_fox_marth4_cold_600() {
+    verify("start_bd_fox_marth4");
+}
+
+#[test]
+fn start_fs_fox_marth4_cold_600() {
+    verify("start_fs_fox_marth4");
+}
+
+#[test]
+fn start_onett_fox_marth4_cold_600() {
+    verify("start_onett_fox_marth4");
+}
+
+#[test]
+fn start_brin_fox_marth4_cold_600() {
+    verify("start_brin_fox_marth4");
+}
+
+#[test]
+fn start_brin_falco_peach4_cold_600() {
+    verify("start_brin_falco_peach4");
+}
+
+#[test]
+fn start_venom_fox_marth4_cold_600() {
+    verify("start_venom_fox_marth4");
+}
+
+#[test]
+fn start_mc_fox_marth4_cold_600() {
+    verify("start_mc_fox_marth4");
+}
+
+#[test]
+fn start_pf_fox_marth4_cold_600() {
+    verify("start_pf_fox_marth4");
+}
+
+#[test]
+fn start_im_fox_marth4_cold_600() {
+    verify("start_im_fox_marth4");
+}
+
+#[test]
+fn start_gb_fox_marth4_cold_600() {
+    verify("start_gb_fox_marth4");
+}
+
+#[test]
+fn start_mk2_fox_marth4_cold_600() {
+    verify("start_mk2_fox_marth4");
+}
+
+#[test]
+fn start_pc_fox_marth4_cold_600() {
+    verify("start_pc_fox_marth4");
+}
+
+#[test]
+fn start_gg_fox_marth4_cold_600() {
+    verify("start_gg_fox_marth4");
+}
+
+#[test]
+fn start_rc_fox_marth4_cold_600() {
+    verify("start_rc_fox_marth4");
+}
+
+#[test]
+fn start_rc_iceclimbers_fox4_cold_600() {
+    verify("start_rc_iceclimbers_fox4");
+}
+
+#[test]
+fn start_mk_fox_marth4_cold_600() {
+    verify("start_mk_fox_marth4");
+}
+
+#[test]
+fn start_yi_fox_marth4_cold_600() {
+    verify("start_yi_fox_marth4");
+}
+
+#[test]
+fn start_ht_fox_marth4_cold_600() {
+    verify("start_ht_fox_marth4");
+}
+
+#[test]
+fn start_fz_fox_marth4_cold_600() {
+    verify("w25_start_fz_fox_marth4_v01");
+}
+
+#[test]
+fn start_jj_fox_marth4_cold_600() {
+    verify("start_jj_fox_marth4");
+}
+
+#[test]
+fn start_ys_fox_cold_600() {
+    verify("start_ys_fox");
+}
+
+#[test]
+fn start_dl_fox_cold_600() {
+    verify("start_dl_fox");
+}

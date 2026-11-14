@@ -1,0 +1,810 @@
+//! Mr. Saturn (It_Kind_Dosei), itdosei.c (80281164..80283558). Ported: the
+//! spawn's fall, the hold, throwing and dropping (a thrown Mr. Saturn pops
+//! back off what it hits), landing into the walk, turning at edges and
+//! walls, falling off the floor, being hit (knocked up, then lying still
+//! until it walks again) and sliding down a floor (state 6); a random
+//! item's spawn fall (8), its sitting (7) and its look round (9) before
+//! the first walk. A slope under a Mr. Saturn nobody has held (state 10)
+//! fails closed.
+//!
+//! The model's turn to its facing (HSD_JObjSetRotationY) is drawing only;
+//! the rotation about the spin axis also aims the ECB (it_80274990) and is
+//! reset where retail resets it.
+use gekko_math::{fma::fmadds, HsdRng};
+use hsd_types::Vec3;
+use melee_it::{
+    desc::ItemAssets,
+    state_change::{ANIM_UPDATE, DROP_UPDATE, MODEL_UPDATE},
+    AirLanding, DoseiState, EnteredAir, ItemAnimationContext, ItemCollisionContext, ItemCore,
+    ItemEventContext, ItemLogic, ItemPhysicsContext, ItemScratch, ItemStateRow, SlidePass,
+    SpawnItem,
+};
+use melee_types::ItemKind;
+
+pub struct Dosei;
+
+/// it_803F55D0's anim_id column.
+pub const ARTICLE_STATES: [i32; 12] = [-1, 0, 2, -1, 3, 1, -1, -1, -1, 0, -1, 3];
+/// itDoseiAttributes: six words.
+pub const SPECIAL_ATTRIBUTES: u32 = 6;
+
+/// Item_80268E5C flag bit 0 (it/forward.h), which this file passes with
+/// ANIM_UPDATE as 3.
+const UNK_0X1: u32 = 1;
+
+mod motion {
+    /// Lying still after a hit's landing (itDosei_80281390).
+    pub const STUNNED: u16 = 0;
+    pub const WALK: u16 = 1;
+    pub const TURN: u16 = 2;
+    pub const FALL: u16 = 3;
+    pub const HELD: u16 = 4;
+    pub const THROWN: u16 = 5;
+    /// Carried down a floor by its slope (itDosei_Logic7_EnteredAir).
+    pub const SLIDE: u16 = 6;
+    /// Sitting where the spawn's fall landed (itDosei_80282CD4).
+    pub const IDLE: u16 = 7;
+    /// The spawn's fall (itDosei_80282BFC).
+    pub const SPAWN_FALL: u16 = 8;
+    /// Looking round before its first walk (itDosei_80282DE4).
+    pub const LOOK: u16 = 9;
+    /// Carried down a floor before anyone held it (itDosei_UnkMotion10).
+    pub const SPAWN_SLIDE: u16 = 10;
+    /// Knocked up by a hit (itDosei_Logic7_DmgReceived).
+    pub const KNOCKED: u16 = 11;
+}
+
+/// itDosei_Logic7_DmgReceived's xDF0: frames it lies still after the
+/// knock's landing (retail 0x80283630: li r0, 0x14).
+const STUN_FRAMES: i32 = 20;
+/// The lifetime a hit costs before it_80273130's own frame (retail "@194").
+const HIT_LIFETIME_COST: f32 = 60.0;
+
+/// itDoseiAttributes.
+struct Attributes<'a>(&'a [f32]);
+impl Attributes<'_> {
+    /// unk0: the animation rate in a hand and in flight.
+    fn carried_rate(&self) -> f32 {
+        self.0[0]
+    }
+    /// unk4 (an int): frames it sits after a spawn's landing.
+    fn idle_frames(&self) -> i32 {
+        self.0[1].to_bits() as i32
+    }
+    /// unk8: the walking speed.
+    fn walk_speed(&self) -> f32 {
+        self.0[2]
+    }
+    /// unkC (an int): the look-round's steps (it turns by pi / unkC a
+    /// frame).
+    fn look_steps(&self) -> i32 {
+        self.0[3].to_bits() as i32
+    }
+    /// unk10 (an int): a hit's horizontal speed along the facing.
+    fn knock_speed_x(&self) -> i32 {
+        self.0[4].to_bits() as i32
+    }
+    /// unk14 (an int): a hit's upward speed, by magnitude.
+    fn knock_speed_y(&self) -> i32 {
+        self.0[5].to_bits() as i32
+    }
+}
+
+static STATES: [ItemStateRow; 12] = {
+    const UNPORTED: ItemStateRow = ItemStateRow {
+        animation_id: -1,
+        animation: unported_animation,
+        physics: unported_physics,
+        collision: unported_collision,
+    };
+    let mut rows = [UNPORTED; 12];
+    rows[motion::STUNNED as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[0],
+        animation: stunned_animation,
+        physics: no_physics,
+        collision: stunned_collision,
+    };
+    rows[motion::SPAWN_SLIDE as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[10],
+        animation: spawn_slide_animation,
+        physics: no_physics,
+        collision: spawn_slide_collision,
+    };
+    rows[motion::KNOCKED as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[11],
+        animation: knocked_animation,
+        physics: gravity_physics,
+        collision: knocked_collision,
+    };
+    rows[motion::WALK as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[1],
+        animation: walk_animation,
+        physics: walk_physics,
+        collision: walk_collision,
+    };
+    rows[motion::TURN as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[2],
+        animation: turn_animation,
+        physics: no_physics,
+        collision: turn_collision,
+    };
+    rows[motion::FALL as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[3],
+        animation: fall_animation,
+        physics: gravity_physics,
+        collision: flight_collision,
+    };
+    // it_803F55D0[4]: no collision callback.
+    rows[motion::HELD as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[4],
+        animation: held_animation,
+        physics: no_physics,
+        collision: no_collision,
+    };
+    // it_803F55D0[6]: no article state, so no animation plays.
+    rows[motion::SLIDE as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[6],
+        animation: slide_animation,
+        physics: no_physics,
+        collision: slide_collision,
+    };
+    rows[motion::IDLE as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[7],
+        animation: idle_animation,
+        physics: no_physics,
+        collision: idle_collision,
+    };
+    rows[motion::SPAWN_FALL as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[8],
+        animation: spawn_fall_animation,
+        physics: gravity_physics,
+        collision: spawn_fall_collision,
+    };
+    rows[motion::LOOK as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[9],
+        animation: look_animation,
+        physics: no_physics,
+        collision: look_collision,
+    };
+    rows[motion::THROWN as usize] = ItemStateRow {
+        animation_id: ARTICLE_STATES[5],
+        animation: no_animation,
+        physics: falling_physics,
+        collision: flight_collision,
+    };
+    rows
+};
+
+impl ItemLogic for Dosei {
+    const KIND: ItemKind = ItemKind::Dosei;
+    const STATES: &'static [ItemStateRow] = &STATES;
+    /// itDosei_Logic7_Spawned (80281164): still, grabbable (it_8026B390),
+    /// then the spawn's fall (itDosei_80282BFC).
+    fn spawned(item: &mut ItemCore, assets: &ItemAssets) {
+        let a = Attributes(&assets.special_attributes);
+        item.velocity = Vec3::ZERO;
+        item.scratch = ItemScratch::Dosei(DoseiState {
+            idle_countdown: a.idle_frames(),
+            recover_timer: 0,
+            throw_scale: 1.0,
+            ..Default::default()
+        });
+        item.grabbable = true;
+        start_spawn_fall(item, assets);
+    }
+    /// it_802BD4AC's Mr. Saturn (Peach's pull): xDE0 takes the item's scale
+    /// after it_80274594 (a unit owner scale in every supported mode).
+    fn launched(
+        item: &mut ItemCore,
+        _assets: &ItemAssets,
+        _common: &melee_it::desc::ItemCommonData,
+        spawn: &SpawnItem,
+        _rng: &mut HsdRng,
+    ) {
+        if spawn.owner.is_some() {
+            let scale = item.scale;
+            dosei_mut(item).throw_scale = scale;
+        }
+    }
+    /// itDosei_Logic7_PickedUp (80282524): the hold at the carried rate,
+    /// its spin locked to the facing (xDC8 x17 and x19).
+    fn picked_up(item: &mut ItemCore, context: &mut ItemAnimationContext<'_>) {
+        enter_held(item, context.assets);
+    }
+    /// itDosei_Logic7_Thrown (8028288C): the flight at the carried rate,
+    /// then it_80274484 at xDE0.
+    fn thrown(item: &mut ItemCore, context: &mut ItemAnimationContext<'_>) {
+        if item.motion == motion::THROWN {
+            change(
+                item,
+                motion::THROWN,
+                ANIM_UPDATE | DROP_UPDATE,
+                context.assets,
+            );
+        } else {
+            item.grabbable = true;
+            change(
+                item,
+                motion::THROWN,
+                ANIM_UPDATE | DROP_UPDATE,
+                context.assets,
+            );
+            item.animation_rate = Attributes(&context.assets.special_attributes).carried_rate();
+        }
+        let scale = dosei(item).throw_scale;
+        item.rescale(scale);
+    }
+    /// itDosei_Logic7_Dropped (802827A8): as a throw without the rescale.
+    fn dropped(item: &mut ItemCore, context: &mut ItemAnimationContext<'_>) {
+        item.grabbable = true;
+        item.spin_ignores_facing = true;
+        item.rotation_axis = 1;
+        change(
+            item,
+            motion::THROWN,
+            ANIM_UPDATE | DROP_UPDATE,
+            context.assets,
+        );
+        item.animation_rate = Attributes(&context.assets.special_attributes).carried_rate();
+    }
+    /// itDosei_Logic7_DmgDealt (802834B8): a voice (Item_8026AF0C of one of
+    /// three sounds by HSD_Randi(3)); in flight it pops back and its
+    /// hitboxes go (it_802725D4).
+    fn damage_dealt(item: &mut ItemCore, context: &ItemEventContext<'_>) -> bool {
+        let rng = context.rng.expect("itDosei_Logic7_DmgDealt draws");
+        let mut r = rng.get();
+        r.randi(3);
+        rng.set(r);
+        if item.motion == motion::THROWN {
+            item.bounce_off_victim(context.victim_bounce);
+            item.clear_hitboxes();
+        }
+        false
+    }
+    /// itDosei_Logic7_DmgReceived (80283588): knocked into the air
+    /// (it_802762BC) along its facing at unk10 and up at |unk14| (both ints;
+    /// retail 0x80283600: fmuls), to lie still for 20 frames where it lands.
+    /// The hit costs 60 frames of its lifetime and it_80273130 one more,
+    /// which ends it at zero.
+    fn damage_received(item: &mut ItemCore, context: &ItemEventContext<'_>) -> bool {
+        let a = Attributes(&context.assets.special_attributes);
+        change(item, motion::KNOCKED, UNK_0X1 | ANIM_UPDATE, context.assets);
+        item.enter_air();
+        item.animation_rate = 1.0;
+        item.velocity = Vec3::new(
+            a.knock_speed_x() as f32 * item.facing,
+            a.knock_speed_y().wrapping_abs() as f32,
+            0.0,
+        );
+        item.spin_ignores_facing = true;
+        item.rotation_axis = 1;
+        dosei_mut(item).recover_timer = STUN_FRAMES;
+        // HSD_JObjSetRotationX/Y/Z: upright and facing its direction. The
+        // ECB follows the rotation about the spin axis (it_80274990), and a
+        // spin left over from a throw goes on turning it in the air
+        // (Item_802697D4), so a Mr. Saturn hit in flight restarts from zero.
+        item.rotation = Vec3::new(
+            0.0,
+            (core::f64::consts::FRAC_PI_2 * f64::from(item.facing)) as f32,
+            0.0,
+        );
+        item.owner = None;
+        item.life_timer -= HIT_LIFETIME_COST;
+        // it_80273130 (80273130).
+        item.life_timer -= 1.0;
+        item.life_timer <= 0.0
+    }
+    /// itDosei_Logic7_EnteredAir (80282B14).
+    const ENTERED_AIR: Option<EnteredAir> = Some(start_sliding);
+    /// itDosei_Logic7_Reflected -> it_80273030.
+    fn reflected(item: &mut ItemCore, context: &ItemEventContext<'_>) -> bool {
+        item.reverse_on_reflect(context.reflected_speed);
+        false
+    }
+    /// itDosei_Logic7_Clanked -> itColl_BounceOffVictim.
+    fn clanked(item: &mut ItemCore, context: &ItemEventContext<'_>) -> bool {
+        item.bounce_off_victim(context.victim_bounce);
+        false
+    }
+    /// itDosei_Logic7_HitShield -> itColl_BounceOffVictim.
+    fn hit_shield(item: &mut ItemCore, context: &ItemEventContext<'_>) -> bool {
+        item.bounce_off_victim(context.victim_bounce);
+        false
+    }
+    /// itDosei_Logic7_ShieldBounced -> itColl_BounceOffShield.
+    fn shield_bounced(item: &mut ItemCore, context: &ItemEventContext<'_>) -> bool {
+        item.bounce_off_shield(context.shield_normal);
+        false
+    }
+}
+
+fn change(item: &mut ItemCore, motion: u16, flags: u32, assets: &ItemAssets) {
+    item.change_motion_with(motion, ARTICLE_STATES[motion as usize], flags, assets);
+}
+
+fn dosei(item: &ItemCore) -> &DoseiState {
+    match &item.scratch {
+        ItemScratch::Dosei(state) => state,
+        _ => panic!("Mr. Saturn scratch"),
+    }
+}
+fn dosei_mut(item: &mut ItemCore) -> &mut DoseiState {
+    match &mut item.scratch {
+        ItemScratch::Dosei(state) => state,
+        _ => panic!("Mr. Saturn scratch"),
+    }
+}
+
+/// itDosei_Logic7_PickedUp and itDosei_UnkMotion4_Anim's restart.
+fn enter_held(item: &mut ItemCore, assets: &ItemAssets) {
+    if item.motion == motion::HELD {
+        change(item, motion::HELD, ANIM_UPDATE, assets);
+        return;
+    }
+    change(item, motion::HELD, ANIM_UPDATE, assets);
+    item.animation_rate = Attributes(&assets.special_attributes).carried_rate();
+    item.spin_ignores_facing = true;
+    item.rotation_axis = 1;
+}
+
+/// it_80272C6C == 0: the state's joint animation has no frames left.
+fn animation_ended(item: &ItemCore, assets: &ItemAssets) -> bool {
+    let article = ARTICLE_STATES[item.motion as usize];
+    usize::try_from(article)
+        .ok()
+        .and_then(|article| assets.animation_ends[article])
+        .is_some_and(|end| item.animation_frame >= end)
+}
+
+/// itDosei_802817A0 (802817A0): on the floor (it_802762B0), walking along
+/// its facing at unk8, its owner forgotten.
+fn start_walking(item: &mut ItemCore, assets: &ItemAssets) {
+    item.slide_mode = 0;
+    item.spin_ignores_facing = true;
+    item.rotation_axis = 1;
+    item.owner = None;
+    item.land_on_floor();
+    change(
+        item,
+        motion::WALK,
+        UNK_0X1 | ANIM_UPDATE | MODEL_UPDATE,
+        assets,
+    );
+    item.animation_rate = 1.0;
+    // retail 80281A8C: fmuls.
+    item.velocity = Vec3::new(
+        item.facing * Attributes(&assets.special_attributes).walk_speed(),
+        0.0,
+        0.0,
+    );
+}
+
+/// itDosei_80281C6C (80281C6C): back to where the frame began, stopped, and
+/// turning round.
+fn start_turning(item: &mut ItemCore, assets: &ItemAssets) {
+    let state = dosei_mut(item);
+    state.turn_phase = 0;
+    let position = state.last_position;
+    state.turn_angle = 0.0;
+    item.position = position;
+    item.velocity.x = 0.0;
+    item.land_on_floor();
+    change(item, motion::TURN, UNK_0X1 | ANIM_UPDATE, assets);
+    item.animation_rate = 1.0;
+    item.owner = None;
+}
+
+/// itDosei_80282074 (80282074): falling off the floor.
+fn start_falling(item: &mut ItemCore, assets: &ItemAssets) {
+    change(item, motion::FALL, UNK_0X1 | ANIM_UPDATE, assets);
+    item.animation_rate = 1.0;
+    item.owner = None;
+}
+
+fn remember_position(item: &mut ItemCore) {
+    let position = item.position;
+    dosei_mut(item).last_position = position;
+}
+
+fn no_animation(_item: &mut ItemCore, _ctx: &mut ItemAnimationContext<'_>) -> bool {
+    false
+}
+fn no_physics(_item: &mut ItemCore, _ctx: &ItemPhysicsContext<'_>) {}
+fn no_collision(_item: &mut ItemCore, _ctx: &mut ItemCollisionContext<'_>) -> bool {
+    false
+}
+
+/// itDosei_UnkMotion4_Anim (802825F8): the hold restarts when it ends.
+fn held_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    if animation_ended(item, ctx.assets) {
+        enter_held(item, ctx.assets);
+    }
+    false
+}
+
+/// itDosei_UnkMotion1_Anim (80281AB4): the walk's rate follows the floor's
+/// slope; the cycle restarts when it ends.
+fn walk_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    let normal = item
+        .collision
+        .as_ref()
+        .expect("item map collision")
+        .floor
+        .normal;
+    // retail 80281AF8: fmuls; 80281B00: fmadds.
+    item.animation_rate = fmadds(0.5, normal.x * item.facing, 1.0);
+    if animation_ended(item, ctx.assets) {
+        change(item, motion::WALK, ANIM_UPDATE, ctx.assets);
+    }
+    false
+}
+
+/// itDosei_UnkMotion1_Phys (80281B44): the walking speed at the rate,
+/// along the facing (fmuls, a sign test, fmuls).
+fn walk_physics(item: &mut ItemCore, ctx: &ItemPhysicsContext<'_>) {
+    let speed = Attributes(&ctx.assets.special_attributes).walk_speed() * item.animation_rate;
+    // fcmpo with bge: only a value not below zero keeps its sign.
+    let speed = if speed >= 0.0 { speed } else { -speed };
+    item.velocity.x = item.facing * speed;
+}
+
+/// itDosei_UnkMotion1_Coll (80281B7C): it_8026D8A4 turns at an edge; a
+/// wall turns it; a floor whose normal's X is pi/4 or more (retail
+/// 0x80281BD8..EC: the constant is an angle, the operand is not) slides it
+/// (xD5C 1, xDC8 x1F, EnteredAir called directly); otherwise it may not
+/// slide (xD5C 0) and leans with the floor. Off the floor it falls.
+fn walk_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    let (grounded, edge) = item.walk_ground_pass(ctx.map);
+    if edge {
+        start_turning(item, ctx.assets);
+    }
+    if !grounded {
+        start_falling(item, ctx.assets);
+        return false;
+    }
+    if item.wall_bits() != 0 {
+        start_turning(item, ctx.assets);
+        return false;
+    }
+    let normal = item
+        .collision
+        .as_ref()
+        .expect("item map collision")
+        .floor
+        .normal;
+    let steep = gekko_math::msl::fabsf(normal.x) >= core::f32::consts::FRAC_PI_4;
+    if steep {
+        item.slide_mode = 1;
+        item.sliding = true;
+        start_sliding(item, ctx.assets);
+    } else {
+        item.slide_mode = 0;
+        item.sliding = false;
+        item.lean_with_floor();
+    }
+    false
+}
+
+/// itDosei_Logic7_EnteredAir (80282B14): a floor's slope carries it off.
+/// One that has been held (xDC8 x19) slides in state 6; one that has not,
+/// in state 10.
+fn start_sliding(item: &mut ItemCore, assets: &ItemAssets) {
+    let motion = if item.spin_ignores_facing {
+        motion::SLIDE
+    } else {
+        motion::SPAWN_SLIDE
+    };
+    change(item, motion, UNK_0X1 | ANIM_UPDATE, assets);
+    item.animation_rate = 1.0;
+    item.owner = None;
+}
+
+/// itDosei_UnkMotion6_Anim (80282B84).
+fn slide_animation(item: &mut ItemCore, _ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    false
+}
+
+/// itDosei_UnkMotion6_Coll (80282BAC): the floor's normal before the pass
+/// is kept (xDF8), then it_8026E8C4: a slide that has stopped walks or
+/// turns (itDosei_80281734); off the floor it falls (itDosei_80282074).
+fn slide_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    let normal = item
+        .collision
+        .as_ref()
+        .expect("item map collision")
+        .floor
+        .normal;
+    dosei_mut(item).floor_normal = normal;
+    match item.ground_collision_with_slide(ctx.map, ctx.assets) {
+        SlidePass::Stopped => walk_or_turn(item, ctx.assets),
+        SlidePass::Airborne => start_falling(item, ctx.assets),
+        SlidePass::Sliding => {}
+    }
+    false
+}
+
+/// itDosei_80281734 (80281734): facing up the floor it slid down (xDF8's
+/// X against its facing) it turns round; otherwise it walks on.
+fn walk_or_turn(item: &mut ItemCore, assets: &ItemAssets) {
+    let slope = dosei(item).floor_normal.x;
+    let uphill = if item.facing == 1.0 {
+        slope < 0.0
+    } else {
+        slope > 0.0
+    };
+    if uphill {
+        start_turning(item, assets);
+    } else {
+        start_walking(item, assets);
+    }
+}
+
+/// itDosei_UnkMotion2_Anim (80281CF8): at the end it walks the other way.
+fn turn_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    if animation_ended(item, ctx.assets) {
+        change(item, motion::WALK, ANIM_UPDATE, ctx.assets);
+        item.facing = -item.facing;
+    }
+    false
+}
+
+/// itDosei_UnkMotion2_Coll (80281E6C): it_8026D62C falls off the floor;
+/// the look-round's walk-off phase (xDD8 2) cannot occur here.
+fn turn_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    if !item.stay_grounded(ctx.map, ctx.assets, ctx.entered_air) {
+        start_falling(item, ctx.assets);
+    }
+    assert_ne!(
+        dosei(item).turn_phase,
+        2,
+        "itDosei_SetupWalk_FC from a turn"
+    );
+    item.lean_with_floor();
+    false
+}
+
+/// itDosei_UnkMotion3_Anim (802820D4): the fall's cycle restarts.
+fn fall_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    if animation_ended(item, ctx.assets) {
+        change(item, motion::FALL, ANIM_UPDATE, ctx.assets);
+    }
+    false
+}
+
+/// itDosei_UnkMotion3_Phys -> it_80272860: gravity only.
+fn gravity_physics(item: &mut ItemCore, ctx: &ItemPhysicsContext<'_>) {
+    item.fall(ctx.assets.fall_acceleration, ctx.assets.fall_speed_limit);
+}
+
+/// itDosei_UnkMotion5_Phys -> Item_ApplyFallingPhysics: gravity, then the
+/// falling spin.
+fn falling_physics(item: &mut ItemCore, ctx: &ItemPhysicsContext<'_>) {
+    item.fall(ctx.assets.fall_acceleration, ctx.assets.fall_speed_limit);
+    item.update_spin(ctx.assets.fall_spin_degrees);
+}
+
+/// itDosei_UnkMotion5_Coll (80282194) -> it_8026E15C: a settled landing
+/// walks (itDosei_802817A0); a thrown Mr. Saturn may break on its first.
+fn flight_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    let cell = ctx.rng.expect("it_8026DDFC draws");
+    let mut rng = cell.get();
+    let landing = item.air_collision_with_landing(ctx.map, ctx.assets, ctx.entered_air, &mut rng);
+    cell.set(rng);
+    match landing {
+        AirLanding::Airborne => false,
+        AirLanding::Landed => {
+            start_walking(item, ctx.assets);
+            false
+        }
+        AirLanding::Broken => true,
+        // it_8026DD5C ran EnteredAir instead of itDosei_802817A0.
+        AirLanding::Sliding => false,
+    }
+}
+
+/// itDosei_UnkMotion11_Anim (802838FC): the knock's cycle restarts.
+fn knocked_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    if animation_ended(item, ctx.assets) {
+        change(item, motion::KNOCKED, ANIM_UPDATE, ctx.assets);
+    }
+    false
+}
+
+/// itDosei_UnkMotion11_Coll (80283990) -> it_8026E15C: a settled landing
+/// lies still (itDosei_80281390).
+fn knocked_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    let cell = ctx.rng.expect("it_8026DDFC draws");
+    let mut rng = cell.get();
+    let landing = item.air_collision_with_landing(ctx.map, ctx.assets, ctx.entered_air, &mut rng);
+    cell.set(rng);
+    match landing {
+        AirLanding::Airborne => false,
+        AirLanding::Landed => {
+            start_stun(item, ctx.assets);
+            false
+        }
+        AirLanding::Broken => true,
+        // it_8026DD5C ran EnteredAir instead of itDosei_80281390.
+        AirLanding::Sliding => false,
+    }
+}
+
+/// itDosei_80281390 (80281390): stopped where it landed.
+fn start_stun(item: &mut ItemCore, assets: &ItemAssets) {
+    item.velocity = Vec3::ZERO;
+    change(item, motion::STUNNED, UNK_0X1 | ANIM_UPDATE, assets);
+    item.animation_rate = 1.0;
+    item.owner = None;
+}
+
+/// itDosei_UnkMotion0_Anim (802813F8): xDF0 counts down, then it walks
+/// (itDosei_802817A0).
+fn stunned_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    let state = dosei_mut(item);
+    state.recover_timer -= 1;
+    if state.recover_timer <= 0 {
+        state.recover_timer = 0;
+        start_walking(item, ctx.assets);
+    }
+    false
+}
+
+/// itDosei_UnkMotion0_Coll (802816F4): it_8026D62C falls off the floor
+/// (itDosei_80282074); it leans with the floor (it_80276CB8).
+fn stunned_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    if !item.stay_grounded(ctx.map, ctx.assets, ctx.entered_air) {
+        start_falling(item, ctx.assets);
+    }
+    item.lean_with_floor();
+    false
+}
+
+/// itDosei_80282BFC (80282BFC): the spawn's fall, owner forgotten.
+fn start_spawn_fall(item: &mut ItemCore, assets: &ItemAssets) {
+    change(item, motion::SPAWN_FALL, UNK_0X1 | ANIM_UPDATE, assets);
+    item.animation_rate = 1.0;
+    item.owner = None;
+}
+
+/// itDosei_UnkMotion8_Anim (80282C68).
+fn spawn_fall_animation(item: &mut ItemCore, _ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    false
+}
+
+/// itDosei_UnkMotion8_Coll (80282CB0) -> it_8026E15C: a settled landing
+/// sits (itDosei_80282CD4).
+fn spawn_fall_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    let cell = ctx.rng.expect("it_8026DDFC draws");
+    let mut rng = cell.get();
+    let landing = item.air_collision_with_landing(ctx.map, ctx.assets, ctx.entered_air, &mut rng);
+    cell.set(rng);
+    match landing {
+        AirLanding::Airborne | AirLanding::Sliding => false,
+        AirLanding::Broken => true,
+        AirLanding::Landed => {
+            sit(item, ctx.assets);
+            false
+        }
+    }
+}
+
+/// itDosei_80282CD4 (80282CD4): still, on the floor, state 7.
+fn sit(item: &mut ItemCore, assets: &ItemAssets) {
+    item.velocity = Vec3::ZERO;
+    item.land_on_floor();
+    change(item, motion::IDLE, UNK_0X1 | ANIM_UPDATE, assets);
+    item.animation_rate = 1.0;
+    item.owner = None;
+}
+
+/// itDosei_UnkMotion10_Anim (itdosei.c:628): the position kept, the rate
+/// back to 1.
+fn spawn_slide_animation(item: &mut ItemCore, _ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    item.animation_rate = 1.0;
+    false
+}
+
+/// itDosei_UnkMotion10_Coll (itdosei.c:643) -> it_8026E8C4: a stopped
+/// slide sits (itDosei_80282CD4), off the floor the spawn's fall
+/// (itDosei_80282BFC).
+fn spawn_slide_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    match item.ground_collision_with_slide(ctx.map, ctx.assets) {
+        SlidePass::Stopped => sit(item, ctx.assets),
+        SlidePass::Airborne => start_spawn_fall(item, ctx.assets),
+        SlidePass::Sliding => {}
+    }
+    false
+}
+
+/// itDosei_UnkMotion7_Anim (80282D18): unk4 frames, then it looks round.
+fn idle_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    let state = dosei_mut(item);
+    if state.idle_countdown > 0 {
+        state.idle_countdown -= 1;
+    } else {
+        start_looking(item, ctx.assets);
+    }
+    false
+}
+
+/// itDosei_UnkMotion7_Coll (80282DA8): it_8026D62C (off the floor the
+/// spawn's fall again), then the lean (it_80276CB8).
+fn idle_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    if !item.stay_grounded(ctx.map, ctx.assets, ctx.entered_air) {
+        start_spawn_fall(item, ctx.assets);
+    }
+    item.lean_with_floor();
+    false
+}
+
+/// itDosei_80282DE4 (80282DE4): turning (xDD8 1) through a quarter turn,
+/// still, its spin locked to the facing (xDC8 x17, x19), state 9, the
+/// model's rotation cleared (its turn about Y is drawing only).
+fn start_looking(item: &mut ItemCore, assets: &ItemAssets) {
+    let state = dosei_mut(item);
+    state.turn_phase = 1;
+    state.turn_angle = core::f32::consts::FRAC_PI_2;
+    item.velocity.x = 0.0;
+    item.rotation_axis = 1;
+    item.spin_ignores_facing = true;
+    item.owner = None;
+    change(item, motion::LOOK, UNK_0X1 | ANIM_UPDATE, assets);
+    item.animation_rate = 1.0;
+    item.rotation = Vec3::ZERO;
+}
+
+/// itDosei_UnkMotion9_Anim (80282EC8): the angle closes by pi / unkC (in
+/// double precision); at zero it walks off at unk8 (xDD8 2). The cycle
+/// restarts when it ends.
+fn look_animation(item: &mut ItemCore, ctx: &mut ItemAnimationContext<'_>) -> bool {
+    remember_position(item);
+    let a = Attributes(&ctx.assets.special_attributes);
+    let state = dosei_mut(item);
+    state.turn_angle =
+        (f64::from(state.turn_angle) - core::f64::consts::PI / f64::from(a.look_steps())) as f32;
+    if state.turn_phase == 1 && state.turn_angle <= 0.0 {
+        state.turn_phase = 2;
+        // retail: fmuls.
+        item.velocity.x = item.facing * a.walk_speed();
+    }
+    if animation_ended(item, ctx.assets) {
+        change(item, motion::LOOK, ANIM_UPDATE, ctx.assets);
+    }
+    false
+}
+
+/// itDosei_UnkMotion9_Coll (80283008): it_8026D62C falls off the floor
+/// (itDosei_80282074); walking off (xDD8 2), it walks from the look's
+/// frame (itDosei_SetupWalk_FC, Item_80268DD4), even in the tick it fell;
+/// then the lean.
+fn look_collision(item: &mut ItemCore, ctx: &mut ItemCollisionContext<'_>) -> bool {
+    if !item.stay_grounded(ctx.map, ctx.assets, ctx.entered_air) {
+        start_falling(item, ctx.assets);
+    }
+    if dosei(item).turn_phase == 2 {
+        let frame = item.animation_frame;
+        start_walking(item, ctx.assets);
+        item.jump_animation_to(frame);
+    }
+    item.lean_with_floor();
+    false
+}
+
+fn unported_animation(item: &mut ItemCore, _ctx: &mut ItemAnimationContext<'_>) -> bool {
+    unimplemented!("itdosei.c: motion state {} animation", item.motion)
+}
+fn unported_physics(item: &mut ItemCore, _ctx: &ItemPhysicsContext<'_>) {
+    unimplemented!("itdosei.c: motion state {} physics", item.motion)
+}
+fn unported_collision(item: &mut ItemCore, _ctx: &mut ItemCollisionContext<'_>) -> bool {
+    unimplemented!("itdosei.c: motion state {} collision", item.motion)
+}

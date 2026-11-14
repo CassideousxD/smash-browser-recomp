@@ -1,0 +1,41 @@
+[package]
+name = "ft-kirby"
+description = "Fighter: Kirby (decomp src/melee/ft/kinds/ftKirby)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+melee-types = { path = "../melee-types" }
+melee-ft = { path = "../melee-ft" }
+ft-fox-family = { path = "../ft-fox-family" }
+ft-captain-family = { path = "../ft-captain-family" }
+ft-mars-family = { path = "../ft-mars-family" }
+ft-purin-family = { path = "../ft-purin-family" }
+ft-gamewatch-family = { path = "../ft-gamewatch-family" }
+ft-mario-family = { path = "../ft-mario-family" }
+ft-luigi-family = { path = "../ft-luigi-family" }
+ft-ness-family = { path = "../ft-ness-family" }
+ft-yoshi-family = { path = "../ft-yoshi-family" }
+ft-link-family = { path = "../ft-link-family" }
+ft-zelda-family = { path = "../ft-zelda-family" }
+ft-koopa-family = { path = "../ft-koopa-family" }
+ft-iceclimbers-family = { path = "../ft-iceclimbers-family" }
+it-drmariopill = { path = "../it-drmariopill" }
+it-seak = { path = "../it-seak" }
+ft-samus-family = { path = "../ft-samus-family" }
+ft-donkey-family = { path = "../ft-donkey-family" }
+ft-mewtwo-family = { path = "../ft-mewtwo-family" }
+ft-pikachu-family = { path = "../ft-pikachu-family" }
+ft-peach-family = { path = "../ft-peach-family" }
+melee-ef = { path = "../melee-ef" }
+melee-it = { path = "../melee-it" }
+melee-coll = { path = "../melee-coll" }
+melee-mp = { path = "../melee-mp" }
+melee-lb = { path = "../melee-lb" }
+melee-cm = { path = "../melee-cm" }
+hsd-types = { path = "../hsd-types" }
+hsd-archive = { path = "../hsd-archive" }
+gekko-math = { path = "../gekko-math" }
+
+[dev-dependencies]
+melee-test-support = { path = "../melee-test-support" }

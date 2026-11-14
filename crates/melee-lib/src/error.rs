@@ -1,0 +1,69 @@
+//! Errors distinguish rejected requests from a fault during simulation.
+use crate::{Port, Stage};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartError {
+    InvalidConfig(&'static str),
+    IncompatibleAssets,
+    Load(String),
+    Initialization(String),
+    /// A Versus stage the port has not ported (fails closed, naming it).
+    UnportedStage(Stage),
+    /// No retail start reaches this seed: a stage whose creation draws a
+    /// variable number of times (Poké Floats' sky, Icicle Mountain's
+    /// controller) has no draw count that ends on it. Another seed will do.
+    UnreachableSeed(String),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepError {
+    InvalidInput { port: Port, reason: &'static str },
+    Finished,
+    Faulted,
+    Simulation(String),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateError {
+    Faulted,
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig(reason) => write!(f, "invalid match configuration: {reason}"),
+            Self::IncompatibleAssets => {
+                f.write_str("assets do not match the selected stage and characters")
+            }
+            Self::Load(reason) => write!(f, "loading game assets: {reason}"),
+            Self::Initialization(reason) => write!(f, "initializing match: {reason}"),
+            Self::UnportedStage(stage) => write!(f, "{}", unported_stage(*stage)),
+            Self::UnreachableSeed(reason) => write!(f, "initializing match: {reason}"),
+        }
+    }
+}
+/// Why a match cannot start on `stage`.
+pub fn unported_stage(stage: Stage) -> String {
+    format!(
+        "{} ({}, StKind {:#04x}) is not ported yet",
+        stage.display_name(),
+        stage.name(),
+        stage.st_kind()
+    )
+}
+impl std::fmt::Display for StepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput { port, reason } => write!(f, "invalid {port:?} input: {reason}"),
+            Self::Finished => f.write_str("match has finished"),
+            Self::Faulted => f.write_str("match is faulted; reset or replace it before stepping"),
+            Self::Simulation(reason) => write!(f, "simulation failed: {reason}"),
+        }
+    }
+}
+impl std::fmt::Display for StateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("match is faulted; reset or replace it before observing")
+    }
+}
+impl std::error::Error for StartError {}
+impl std::error::Error for StepError {}
+impl std::error::Error for StateError {}

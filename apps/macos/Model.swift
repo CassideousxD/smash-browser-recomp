@@ -1,0 +1,462 @@
+import AppKit
+import Combine
+
+/// A message for the user, shown as a glass card (DESIGN.md "Errors and notices").
+struct Notice: Identifiable, Equatable {
+    let id = UUID()
+    var title: String
+    var message: String
+}
+
+/// Keys the menus understand; the window maps key codes and pad menu
+/// events to these (docs/APP.md lists every binding).
+enum MenuKey {
+    case left, right, up, down, enter, escape, tab, backTab, costumePrevious, costumeNext, clear, fewerStocks,
+         moreStocks
+    /// A pad's B: clear the pick, close a card, or go back.
+    case back
+    /// A pad's Start: ready to fight, resume, rematch.
+    case start
+    /// A pad's Z, Select or Home: the app menu.
+    case appMenu
+}
+
+/// Observable mirror of the core for the SwiftUI menus. It forwards intent
+/// to the core and re-reads the core's state after every call.
+final class AppModel: ObservableObject {
+    let core = Core()
+    let characters = Core.characters
+    let stages = Core.stages
+
+    @Published private(set) var screen: Screen = .disc
+    @Published private(set) var selection = Selection()
+    @Published private(set) var rules = Rules()
+    /// The rules card is open over character select.
+    @Published var showingRules = false { didSet { closed(showingRules, FocusLayer.card) } }
+    @Published private(set) var progress = LoadProgress()
+    @Published private(set) var hud: Hud?
+    @Published private(set) var results: MatchResults?
+    @Published private(set) var disc: DiscInfo?
+    @Published private(set) var paused = false
+    @Published private(set) var recent: [RecentDisc] = RecentDiscs.load()
+    /// The player whose pick the next character click sets.
+    @Published var picking = 0
+    /// The card on top of the menus, if any.
+    @Published var notice: Notice?
+
+    // Menu navigation: the focused control (Focus.swift), the character
+    // grid cursor (a character id) and the stage row cursor (stages, then
+    // Random), which follow focus on their tiles.
+    @Published var focusID: String?
+    var focusTargets: [FocusTarget] = []
+    /// A key pressed before the controls it acts on reported in (Focus.swift).
+    var pendingKey: (MenuKey, Date)?
+    @Published var cursor: Int32 = 0
+    @Published var stageCursor = 0
+
+    // Gamepads (Gamepads.swift reads them, the core maps them).
+    @Published private(set) var pads: [PadInfo] = []
+    /// The controllers card is open (over any menu or the pause card).
+    @Published var showingControllers = false { didSet { closed(showingControllers, FocusLayer.controllers) } }
+    /// The pad the controllers card edits.
+    @Published var settingsPad: UInt32?
+    /// The app menu (pads' stand-in for the menu bar).
+    @Published var showingAppMenu = false { didSet { closed(showingAppMenu, FocusLayer.appMenu) } }
+    /// A short message that fades (a pad joined).
+    @Published var toast: String?
+    /// The key being handled came from a pad (no panels: they need a mouse).
+    var padInput = false
+    /// The pad that last pressed something.
+    var lastPad: UInt32?
+    /// Where the pointer was when it last took focus (Focus.swift).
+    var lastPointer = NSEvent.mouseLocation
+    private var toastTimer: Timer?
+    /// Bumped when runtime-rendered art (stage previews) becomes available.
+    @Published private(set) var artGeneration = 0
+    /// The stage the Random tile is shuffling through, while it shuffles.
+    @Published private(set) var shuffling: Int?
+    /// The stage of the match being loaded or played (loading shows it).
+    @Published private(set) var lastStage: UInt32?
+
+    /// Errors and notices: a card on top of the menus.
+    lazy var present: (String, String) -> Void = { [weak self] title, message in
+        self?.notice = Notice(title: title, message: message)
+    }
+    /// A match fault: the window offers to save the replay.
+    var presentFault: ((String) -> Void)?
+    var screenChanged: ((Screen) -> Void)?
+    /// Pausing or resuming changes whether the match needs display frames.
+    var framesChanged: (() -> Void)?
+    var openPanel: (() -> Void)?
+    var saveReplayPanel: (() -> Void)?
+    /// The app menu's commands (the window controller runs them).
+    var appMenuAction: ((AppMenuAction) -> Void)?
+    /// The window is full screen (the app menu's title says which way).
+    @Published var fullScreen = false
+
+    // Development only (screenshots): hold the loading screen, and show
+    // results or HUD percents over a running match.
+    var holdLoading = false
+    @Published var previewResults: MatchResults?
+    var previewPercents: [Float]?
+
+    private var loadScheduled = false
+    private var previewTimer: Timer?
+
+    func character(_ id: Int32?) -> CharacterInfo? {
+        guard let id else { return nil }
+        return characters.first { $0.id == id }
+    }
+
+    func sync() {
+        let previous = screen
+        screen = core.screen
+        selection = core.selection
+        rules = core.rules
+        disc = core.disc
+        progress = core.progress
+        results = core.results
+        hud = core.hud
+        if screen != .match { paused = false }
+        if let notice = core.takeNotice() {
+            present("Melee", notice)
+        }
+        if screen == .loading && !loadScheduled && !holdLoading {
+            loadScheduled = true
+            DispatchQueue.main.async { self.pumpLoading() }
+        }
+        if previous != screen {
+            enter(screen)
+            screenChanged?(screen)
+        }
+    }
+
+    /// Reset navigation for a newly shown screen.
+    private func enter(_ screen: Screen) {
+        focusID = nil
+        // The new screen registers its controls on its first layout; a match
+        // in play registers none, so nothing of the last screen may linger.
+        focusTargets = []
+        shuffling = nil
+        if screen != .characters { showingRules = false }
+        if screen == .characters, let pick = selection.players[picking].character { cursor = pick }
+        switch screen {
+        case .characters: focusID = "tile.\(cursor)"
+        case .stages: focusID = "stage.\(stageCursor)"
+        case .disc: focusID = "disc.0"
+        case .results: focusID = "results.0"
+        default: break
+        }
+        if screen == .stages { pollPreviews() } else { previewTimer?.invalidate(); previewTimer = nil }
+    }
+
+    /// Stage previews arrive after the menus open; poll until all are drawn.
+    private func pollPreviews() {
+        previewTimer?.invalidate()
+        previewTimer = nil
+        guard !core.stagePreviewsReady else { return }
+        var seen = 0
+        previewTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            // Each preview shows as soon as it is drawn.
+            let ready = self.stages.filter { self.core.stagePreview($0.id) != nil }.count
+            if ready != seen { seen = ready; self.artGeneration &+= 1 }
+            if self.core.stagePreviewsReady || self.screen != .stages {
+                if ready != self.stages.count { self.artGeneration &+= 1 }
+                timer.invalidate()
+                self.previewTimer = nil
+            }
+        }
+    }
+
+    private func perform(_ title: String = "Melee", _ body: () throws -> Void) {
+        do { try body() } catch { present(title, error.localizedDescription) }
+        sync()
+    }
+
+    // MARK: Disc
+
+    func openDisc(_ url: URL) {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        notice = nil
+        do {
+            try core.openDisc(path: url.path)
+            RecentDiscs.add(url)
+            recent = RecentDiscs.load()
+        } catch {
+            present("That disc image cannot be used", error.localizedDescription)
+        }
+        sync()
+    }
+    func openRecent(_ disc: RecentDisc) {
+        guard let url = disc.resolve() else {
+            present("Disc not found", "\(disc.name) has moved or been deleted.")
+            RecentDiscs.remove(disc)
+            recent = RecentDiscs.load()
+            return
+        }
+        openDisc(url)
+    }
+    /// Development (screenshots of a first launch): show no recent discs.
+    func hideRecentDiscs() { recent = [] }
+    func resumeDisc() { perform { try core.resumeDisc() } }
+
+    // MARK: Character select
+
+    func choose(_ character: CharacterInfo) {
+        cursor = character.id
+        perform { try core.choose(player: picking, character: character.id) }
+        // Move on to the next player in the match who still needs a pick.
+        let waiting = (1..<slotCount).map { (picking + $0) % slotCount }
+            .first { selection.players[$0].active && selection.players[$0].character == nil }
+        if let waiting { picking = waiting }
+    }
+    func clear(player: Int) {
+        perform { try core.choose(player: player, character: nil) }
+        picking = player
+    }
+    /// Make a player the one picking; the cursor jumps to their fighter.
+    func activate(player: Int) {
+        picking = player
+        if let pick = selection.players[player].character {
+            cursor = pick
+            // Focus on the grid follows the cursor to that fighter.
+            if focusID?.hasPrefix("tile.") ?? true { focusID = "tile.\(pick)" }
+        }
+    }
+    func setCostume(player: Int, costume: Int) { perform { try core.setCostume(player: player, costume: costume) } }
+    func cycleCostume(player: Int, step: Int32) { perform { try core.cycleCostume(player: player, step: step) } }
+    func setStocks(_ stocks: Int) { update { $0.stocks = stocks } }
+    func setController(player: Int, _ controller: Controller) {
+        perform { try core.setController(player: player, controller) }
+    }
+    /// Human, CPU, off, around again.
+    func cycleController(player: Int) {
+        let next: Controller = switch selection.players[player].controller {
+        case .human: .cpu
+        case .cpu: .off
+        case .off: .human
+        }
+        setController(player: player, next)
+    }
+    func setCpuLevel(player: Int, level: Int) { perform { try core.setCpuLevel(player: player, level: level) } }
+    func setTeam(player: Int, team: Int) { perform { try core.setTeam(player: player, team: team) } }
+    func cycleTeam(player: Int) { setTeam(player: player, team: (selection.players[player].team + 1) % teamNames.count) }
+    func setHandicap(player: Int, handicap: Int) {
+        perform { try core.setHandicap(player: player, handicap: handicap) }
+    }
+    /// Change the rules; the core checks them.
+    func update(_ change: (inout Rules) -> Void) {
+        var next = core.rules
+        change(&next)
+        perform { try core.setRules(next) }
+    }
+    /// Handicap is a per-player setting; the rules card's switch only
+    /// shows the steppers (off clears every handicap).
+    @Published private(set) var handicapRule = false
+    var showsHandicap: Bool { handicapRule || selection.players.contains { $0.handicap != 0 } }
+    func setHandicapRule(_ on: Bool) {
+        handicapRule = on
+        guard !on else { return }
+        for player in 0..<slotCount where selection.players[player].handicap != 0 {
+            setHandicap(player: player, handicap: 0)
+        }
+    }
+    /// Why a stage cannot host the current picks, or nil.
+    func stageUnavailable(_ stage: StageInfo) -> String? { core.stageUnavailable(stage.id) }
+    func confirmCharacters() { perform { try core.confirmCharacters() } }
+    func back() { core.back(); sync() }
+
+    // MARK: Stage select and loading
+
+    func chooseStage(_ stage: StageInfo) {
+        lastStage = stage.id
+        perform { try core.chooseStage(stage.id) }
+    }
+
+    /// The Random tile: a quick shuffle along the row, then the pick.
+    func chooseRandomStage(reduceMotion: Bool) {
+        let playable = stages.indices.filter { stageUnavailable(stages[$0]) == nil }
+        guard shuffling == nil, let target = playable.randomElement() else { return }
+        if reduceMotion { return chooseStage(stages[target]) }
+        let steps = stages.count + target
+        for step in 0...steps {
+            // Ease out: each hop a little slower than the last; under a second.
+            let t = Double(step) / Double(steps)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45 * t * t + 0.25 * t) { [weak self] in
+                guard let self, self.screen == .stages else { return }
+                self.shuffling = step % self.stages.count
+                self.stageCursor = step % self.stages.count
+                guard step == steps else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    guard self.screen == .stages else { return }
+                    self.shuffling = nil
+                    self.chooseStage(self.stages[target])
+                }
+            }
+        }
+    }
+    /// From results: back to stage select with the same picks.
+    func toStageSelect() {
+        previewResults = nil
+        core.quitToMenu()
+        perform { try core.confirmCharacters() }
+    }
+
+    /// Read files in slices of ~16 ms so the progress bar keeps moving.
+    private func pumpLoading() {
+        loadScheduled = false
+        if holdLoading { return }
+        guard core.screen == .loading else { return sync() }
+        let start = Date()
+        do {
+            while try core.loadStep() {
+                if Date().timeIntervalSince(start) > 0.016 {
+                    progress = core.progress
+                    loadScheduled = true
+                    DispatchQueue.main.async { self.pumpLoading() }
+                    return
+                }
+            }
+            progress = core.progress
+            // Let the full bar draw before the match build blocks briefly.
+            DispatchQueue.main.async {
+                do { try self.core.finishLoading() } catch {}
+                self.sync()
+            }
+        } catch {
+            sync()
+        }
+    }
+
+    // MARK: Match
+
+    /// One display frame: advance, draw, refresh the HUD.
+    func frame(width: UInt32, height: UInt32) {
+        guard core.screen == .match else { return }
+        do {
+            try core.frame(width: width, height: height)
+        } catch {
+            let message = core.takeNotice() ?? error.localizedDescription
+            hud = core.hud
+            presentFault?(message)
+            return
+        }
+        // Republish only what the HUD draws (not the tick): the overlay then
+        // re-renders on damage and stock changes, not every frame.
+        let next = core.hud
+        if next?.players != hud?.players || next?.paused != hud?.paused || next?.faulted != hud?.faulted {
+            hud = next
+        }
+        if core.screen != screen { sync() }
+    }
+    var needsFrame: Bool { core.needsFrame }
+    func action(player: Int, _ action: GameAction, down: Bool) { core.action(player: player, action, down: down) }
+    func setPaused(_ value: Bool) {
+        guard screen == .match else { return }
+        core.setPaused(value)
+        if value && !paused { focusID = "pause.0" }
+        paused = value
+        hud = core.hud
+        framesChanged?()
+    }
+    func togglePause() { setPaused(!paused) }
+    func setFocused(_ focused: Bool) { core.setFocused(focused) }
+    func restart() { perform { try core.restart() }; paused = false; framesChanged?() }
+    func rematch() { previewResults = nil; perform { try core.rematch() } }
+    func quitToMenu() { previewResults = nil; core.quitToMenu(); sync() }
+    func saveReplay(to url: URL) { perform("Could not save the replay") { try core.saveReplay(to: url.path) } }
+
+    // MARK: Gamepads
+
+    /// Re-read the pads (connected, joined, rebound).
+    func padsChanged() {
+        let next = core.pads
+        if next != pads { pads = next }
+        if let settingsPad, !pads.contains(where: { $0.handle == settingsPad }) { self.settingsPad = pads.first?.handle }
+        Gamepads.savePrefs(core)
+    }
+    /// After each poll: the controllers card shows live sticks and buttons.
+    func padsPolled() {
+        // Focus is always on something (a card that just closed can leave none).
+        ensureFocus()
+        replayPendingKey()
+        guard showingControllers else { return }
+        let next = core.pads
+        if next != pads { pads = next }
+    }
+    func showToast(_ text: String) {
+        toast = text
+        toastTimer?.invalidate()
+        toastTimer = Timer.scheduledTimer(withTimeInterval: 2.2, repeats: false) { [weak self] _ in self?.toast = nil }
+    }
+    /// The pad driving a controller port.
+    func pad(port: Int) -> PadInfo? { pads.first { $0.port == port } }
+
+    func openControllers() {
+        showingAppMenu = false
+        settingsPad = lastPad.flatMap { handle in pads.first { $0.handle == handle }?.handle } ?? pads.first?.handle
+        showingControllers = true
+        focusID = nil
+    }
+    func closeControllers() {
+        if let settingsPad { core.padListen(handle: settingsPad, target: nil) }
+        showingControllers = false
+        focusID = nil
+        padsChanged()
+    }
+    /// Change the edited pad's settings through the core, then save.
+    func editPad(_ change: (Core, UInt32) -> Void) {
+        guard let settingsPad else { return }
+        change(core, settingsPad)
+        padsChanged()
+    }
+}
+
+/// Discs opened before, as bookmarks so they survive renames and moves.
+struct RecentDisc: Identifiable, Hashable {
+    let bookmark: Data
+    let name: String
+    var id: Data { bookmark }
+
+    func resolve() -> URL? {
+        var stale = false
+        for options: URL.BookmarkResolutionOptions in [.withSecurityScope, []] {
+            if let url = try? URL(resolvingBookmarkData: bookmark, options: options, relativeTo: nil,
+                                  bookmarkDataIsStale: &stale),
+               FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+        return nil
+    }
+}
+
+enum RecentDiscs {
+    private static let key = "recentDiscs"
+    private static let limit = 5
+
+    static func load() -> [RecentDisc] {
+        let entries = UserDefaults.standard.array(forKey: key) as? [[String: Any]] ?? []
+        return entries.compactMap { entry in
+            guard let data = entry["bookmark"] as? Data, let name = entry["name"] as? String else { return nil }
+            return RecentDisc(bookmark: data, name: name)
+        }
+    }
+    private static func store(_ discs: [RecentDisc]) {
+        UserDefaults.standard.set(discs.prefix(limit).map { ["bookmark": $0.bookmark, "name": $0.name] },
+                                  forKey: key)
+    }
+    static func add(_ url: URL) {
+        let bookmark = (try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil,
+                                              relativeTo: nil))
+            ?? (try? url.bookmarkData())
+        guard let bookmark else { return }
+        let others = load().filter { $0.resolve()?.standardizedFileURL != url.standardizedFileURL }
+        store([RecentDisc(bookmark: bookmark, name: url.lastPathComponent)] + others)
+    }
+    static func remove(_ disc: RecentDisc) {
+        store(load().filter { $0 != disc })
+    }
+}

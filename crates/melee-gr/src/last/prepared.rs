@@ -1,0 +1,539 @@
+//! Preloaded stage joint clocks. Animation switches recycle track storage.
+use super::animation::BackgroundAnimation;
+use hsd_anim::{
+    aobj::AObj,
+    jobj::JObjId,
+    load::{attach_anim_joint, load_joint_tree},
+};
+use hsd_archive::Archive;
+
+impl BackgroundAnimation {
+    /// Prepare every grAnime_801C7C1C joint animation before the tick loop.
+    pub fn prepare_switches(
+        &mut self,
+        archive: &Archive,
+        model: &crate::desc::ModelDesc,
+    ) -> crate::desc::ReadResult<()> {
+        let (mut tree, root) = load_joint_tree(archive, &model.joint)?;
+        let mut maximum_tracks = 0;
+        for (index, animation) in model.animations.iter().enumerate() {
+            for &joint in &self.joints {
+                tree.remove_anim(joint);
+            }
+            attach_anim_joint(&mut tree, root, animation, archive)?;
+            let clocks = self
+                .joints
+                .iter()
+                .map(|&joint| {
+                    let mut clock = tree.get(joint).aobj.clone();
+                    if let Some(a) = &mut clock {
+                        maximum_tracks = maximum_tracks.max(a.fobj.len());
+                        if model.animation_loops[index] {
+                            a.flags |= hsd_anim::aobj::AOBJ_LOOP;
+                        }
+                    }
+                    clock
+                })
+                .collect();
+            self.prepared.push(clocks);
+        }
+        self.subtree_ends = self
+            .joints
+            .iter()
+            .enumerate()
+            .map(|(index, &joint)| {
+                let mut count = 0;
+                self.tree.walk_tree(joint, &mut |_, _| count += 1);
+                index + count
+            })
+            .collect();
+        self.reserve_events(maximum_tracks);
+        Ok(())
+    }
+
+    /// grAnime_801C7FF8 / 801C8098: all descendants or one joint respectively.
+    pub fn play_prepared(&mut self, bone: usize, index: usize, subtree: bool) {
+        let end = if subtree {
+            self.subtree_ends[bone]
+        } else {
+            bone + 1
+        };
+        for slot in bone..end {
+            self.play_materials(index, slot, slot + 1);
+            let joint = self.joints[slot];
+            let Some(source) = &self.prepared[index][slot] else {
+                self.tree.remove_anim_by_flags(joint, 1);
+                continue;
+            };
+            let mut tracks = self.tree.take_animation_tracks(joint);
+            tracks.clear();
+            tracks.extend(source.fobj.iter().cloned());
+            let mut clock = AObj {
+                flags: source.flags,
+                curr_frame: source.curr_frame,
+                rewind_frame: source.rewind_frame,
+                end_frame: source.end_frame,
+                framerate: 1.0,
+                fobj: tracks,
+            };
+            clock.req_anim(0.0);
+            self.tree.get_mut(joint).aobj = Some(clock);
+        }
+    }
+    /// grAnime_801C7980 clears looping; it does not stop playback.
+    pub fn clear_joint_loop(&mut self, bone: usize) {
+        if let Some(a) = &mut self.tree.get_mut(self.joints[bone]).aobj {
+            a.clear_flags(hsd_anim::aobj::AOBJ_LOOP);
+        }
+    }
+    /// grAnime_801C752C over `bone`'s subtree with every animation type
+    /// (mask 7): each joint, material and texture AObj. The subtree's
+    /// descendant indices follow `bone` in walk order.
+    fn for_each_subtree_aobj(&mut self, bone: usize, mut visit: impl FnMut(&mut hsd_anim::aobj::AObj)) {
+        let mut count = 0;
+        self.tree.walk_tree(self.joints[bone], &mut |_, _| count += 1);
+        for part in bone..bone + count {
+            let joint = self.joints[part];
+            if let Some(aobj) = &mut self.tree.get_mut(joint).aobj {
+                visit(aobj);
+            }
+            if let Some(objects) = self.tree.dobj_mut(joint) {
+                for object in objects {
+                    if let Some(material) = &mut object.mobj {
+                        if let Some(aobj) = &mut material.aobj {
+                            visit(aobj);
+                        }
+                        for texture in &mut material.textures {
+                            if let Some(aobj) = &mut texture.animation {
+                                visit(aobj);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// `grAnime_801C77FC(gobj, bone, 7)` (0x801C77FC): every AObj of
+    /// `bone`'s subtree loops (fn_801C6F2C: HSD_AObjSetFlags(AOBJ_LOOP)).
+    pub fn set_subtree_loops(&mut self, bone: usize) {
+        self.for_each_subtree_aobj(bone, |a| a.set_flags(hsd_anim::aobj::AOBJ_LOOP));
+    }
+    /// `grAnime_801C78FC(gobj, bone, 7)` (0x801C78FC): every AObj of
+    /// `bone`'s subtree stops looping (HSD_AObjClearFlags(AOBJ_LOOP)).
+    pub fn clear_subtree_loops_all(&mut self, bone: usize) {
+        self.for_each_subtree_aobj(bone, |a| a.clear_flags(hsd_anim::aobj::AOBJ_LOOP));
+    }
+    /// `grAnime_801C7A04(gobj, bone, 7, rate)` (0x801C7A04): every AObj of
+    /// `bone`'s subtree plays at `rate` (HSD_AObjSetRate).
+    pub fn set_subtree_animation_rate(&mut self, bone: usize, rate: f32) {
+        self.for_each_subtree_aobj(bone, |a| a.set_rate(rate));
+    }
+    /// `grAnime_801C7B24(gobj, bone, 7, frame)` (0x801C7B24): `bone`'s
+    /// subtree requested at `frame` (HSD_JObjReqAnimAllByFlags, every type).
+    pub fn request_subtree_frame_all(&mut self, bone: usize, frame: f32) {
+        self.for_each_subtree_aobj(bone, |a| a.req_anim(frame));
+    }
+    /// `HSD_JObjGetTranslationY` of the Ground GObj's JObj.
+    pub fn gobj_translation_y(&self) -> f32 {
+        self.gobj_translation().y
+    }
+    /// `HSD_JObjSetTranslateY` of the Ground GObj's JObj.
+    pub fn set_gobj_translate_y(&mut self, y: f32) {
+        let joint = self.tree.parent(self.root).unwrap_or(self.root);
+        self.tree.set_translate_y(joint, y);
+    }
+    /// `grAnime_801C7BA0(gobj, bone, 1, frame)` (0x801C7BA0):
+    /// HSD_JObjReqAnimByFlags(0x81) on that joint alone.
+    pub fn request_joint_frame(&mut self, bone: usize, frame: f32) {
+        self.tree.req_anim_by_flags(self.joints[bone], 0x81, frame);
+    }
+    /// `grAnime_801C752C(jobj, 1, ..., HSD_AObjSetFlags, 3, AOBJ_LOOP)`: every
+    /// joint clock of the model loops.
+    pub fn loop_all(&mut self) {
+        for &joint in &self.joints {
+            if let Some(aobj) = &mut self.tree.get_mut(joint).aobj {
+                aobj.flags |= hsd_anim::aobj::AOBJ_LOOP;
+            }
+        }
+    }
+    /// grAnime_801C7A94 affects one joint's rate, without rewinding its clock.
+    pub fn set_joint_rate(&mut self, bone: usize, rate: f32) {
+        if let Some(a) = &mut self.tree.get_mut(self.joints[bone]).aobj {
+            a.framerate = rate;
+        }
+    }
+    pub fn joint_ended(&self, bone: usize) -> bool {
+        self.tree
+            .get(self.joints[bone])
+            .aobj
+            .as_ref()
+            .is_none_or(|a| a.flags & hsd_anim::aobj::AOBJ_NO_ANIM != 0)
+    }
+    pub fn joint_frame(&self, bone: usize) -> Option<f32> {
+        self.tree
+            .get(self.joints[bone])
+            .aobj
+            .as_ref()
+            .map(|a| a.curr_frame)
+    }
+    pub fn joint_rewound(&self, bone: usize) -> bool {
+        self.tree
+            .get(self.joints[bone])
+            .aobj
+            .as_ref()
+            .is_some_and(|a| a.flags & hsd_anim::aobj::AOBJ_REWINDED != 0)
+    }
+    pub fn joint_matrix(&mut self, bone: usize) -> hsd_types::Mtx {
+        *self.tree.get_mtx(self.joints[bone])
+    }
+    /// The matrix of a model bone that outlives its released model because
+    /// a particle generator still references it. HSD_JObjRemoveAll (jobj.c,
+    /// from JObjRelease's release_child) clears the survivor's parent, so the
+    /// HSD_JObjSetupMatrix that hsd_8039D214 (0x8039D214) runs on the dirty
+    /// joint builds its matrix from its own scale, rotation and translation
+    /// alone (HSD_JObjMakeMatrix with no parent and no parent scale).
+    pub fn released_joint_matrix(&self, bone: usize) -> hsd_types::Mtx {
+        use hsd_anim::{jobj::JOBJ_USE_QUATERNION, mtx};
+        let joint = self.tree.get(self.joints[bone]);
+        let mut matrix = joint.mtx;
+        if joint.flags & JOBJ_USE_QUATERNION != 0 {
+            mtx::hsd_mtx_srt_quat(
+                &mut matrix,
+                &joint.scale,
+                &joint.rotate,
+                &joint.translate,
+                None,
+            );
+        } else {
+            let euler = hsd_types::Vec3::new(joint.rotate.x, joint.rotate.y, joint.rotate.z);
+            mtx::hsd_mtx_srt(&mut matrix, &joint.scale, &euler, &joint.translate, None);
+        }
+        matrix
+    }
+    pub fn set_joint_scale(&mut self, bone: usize, scale: hsd_types::Vec3) {
+        self.tree.set_scale(self.joints[bone], &scale);
+    }
+    pub fn joint_scale(&self, bone: usize) -> hsd_types::Vec3 {
+        self.tree.scale(self.joints[bone])
+    }
+    /// `HSD_JObjGetRotation` of a model bone, as the Euler angles its
+    /// rotation's x, y and z hold.
+    pub fn joint_rotation(&self, bone: usize) -> hsd_types::Vec3 {
+        let rotation = self.tree.rotation(self.joints[bone]);
+        hsd_types::Vec3::new(rotation.x, rotation.y, rotation.z)
+    }
+    /// `HSD_JObjSetRotationX` of a model bone.
+    pub fn set_joint_rotation_x(&mut self, bone: usize, x: f32) {
+        self.tree.set_rotation_x(self.joints[bone], x);
+    }
+    /// `HSD_JObjSetRotationZ` of a model bone.
+    pub fn set_joint_rotation_z(&mut self, bone: usize, z: f32) {
+        self.tree.set_rotation_z(self.joints[bone], z);
+    }
+    /// `HSD_JObjGetRotationZ` of a model bone.
+    pub fn joint_rotation_z(&self, bone: usize) -> f32 {
+        self.tree.rotation_z(self.joints[bone])
+    }
+    /// grAnime_801C7A04(gobj, 0, 7, rate) (0x801C7A04): every joint
+    /// animation of the model plays at `rate`.
+    pub fn set_animation_rate(&mut self, rate: f32) {
+        for bone in 0..self.joints.len() {
+            self.set_joint_rate(bone, rate);
+        }
+    }
+    /// Restore a saved live animation while retaining the archive-owned joint.
+    pub fn restore_joint_animation(
+        &mut self,
+        bone: usize,
+        animation: Option<hsd_anim::aobj::AObj>,
+    ) {
+        self.tree.get_mut(self.joints[bone]).aobj = animation;
+    }
+    /// `HSD_JObjGetTranslation` of a model bone.
+    pub fn joint_translation(&self, bone: usize) -> hsd_types::Vec3 {
+        self.tree.translation(self.joints[bone])
+    }
+    /// `HSD_JObjSetTranslate` of a model bone.
+    pub fn set_joint_translate(&mut self, bone: usize, translate: hsd_types::Vec3) {
+        self.tree.set_translate(self.joints[bone], &translate);
+    }
+    /// `HSD_JObjSetTranslateY` of a model bone.
+    pub fn set_joint_translate_y(&mut self, bone: usize, y: f32) {
+        self.tree.set_translate_y(self.joints[bone], y);
+    }
+    /// `HSD_JObjSetFlags` / `HSD_JObjClearFlags(bone, JOBJ_HIDDEN)`: that
+    /// joint alone.
+    pub fn set_joint_hidden_only(&mut self, bone: usize, hidden: bool) {
+        let joint = self.joints[bone];
+        if hidden {
+            self.tree.set_flags(joint, hsd_anim::jobj::JOBJ_HIDDEN);
+        } else {
+            self.tree.clear_flags(joint, hsd_anim::jobj::JOBJ_HIDDEN);
+        }
+    }
+    /// `HSD_JObjGetScaleY` of a model bone.
+    pub fn joint_scale_y(&self, bone: usize) -> f32 {
+        self.tree.scale_y(self.joints[bone])
+    }
+    /// `HSD_JObjSetScaleY` of a model bone.
+    pub fn set_joint_scale_y(&mut self, bone: usize, y: f32) {
+        self.tree.set_scale_y(self.joints[bone], y);
+    }
+    /// A recreated map's GObj JObj as Ground_GetStageGObj makes it: at the
+    /// origin, unturned, at the map scale, shown (its own flag only).
+    pub fn reset_gobj_joint(&mut self, map_scale: f32) {
+        let joint = self.tree.parent(self.root).unwrap_or(self.root);
+        self.tree.set_translate(joint, &hsd_types::Vec3::ZERO);
+        self.tree.set_rotation_x(joint, 0.0);
+        self.tree.set_rotation_y(joint, 0.0);
+        self.tree.set_rotation_z(joint, 0.0);
+        self.tree
+            .set_scale(joint, &hsd_types::Vec3::new(map_scale, map_scale, map_scale));
+        self.tree.clear_flags(joint, hsd_anim::jobj::JOBJ_HIDDEN);
+    }
+    /// `HSD_JObjResetRST(bone, archive joint)` (grAnime_801C86D4): the
+    /// bone's rotation, scale and translation back to the archive's.
+    pub fn reset_joint_pose(&mut self, bone: usize) {
+        let id = self.joints[bone];
+        let source = self.rest.get(id);
+        let (rotate, scale, translate) = (source.rotate, source.scale, source.translate);
+        let joint = self.tree.get_mut(id);
+        joint.rotate = rotate;
+        joint.scale = scale;
+        joint.translate = translate;
+        self.tree.set_flags(id, hsd_anim::jobj::JOBJ_MTX_DIRTY);
+    }
+    /// `HSD_JObjSetTranslateX` of a model bone.
+    pub fn set_joint_translate_x(&mut self, bone: usize, x: f32) {
+        self.tree.set_translate_x(self.joints[bone], x);
+    }
+    /// `HSD_JObjSetTranslateZ` of a model bone.
+    pub fn set_joint_translate_z(&mut self, bone: usize, z: f32) {
+        self.tree.set_translate_z(self.joints[bone], z);
+    }
+    /// `HSD_JObjSetRotationY` of a model bone.
+    pub fn set_joint_rotation_y(&mut self, bone: usize, y: f32) {
+        self.tree.set_rotation_y(self.joints[bone], y);
+    }
+    /// `lb_8000B1CC(bone, &offset, &out)` (0x8000B1CC): `offset` in the
+    /// bone's world frame (PSMTXMultVec).
+    pub fn joint_point(&mut self, bone: usize, offset: hsd_types::Vec3) -> hsd_types::Vec3 {
+        let matrix = self.joint_matrix(bone);
+        let mut out = hsd_types::Vec3::ZERO;
+        hsd_anim::mtx::mtx_mult_vec(&matrix, &offset, &mut out);
+        out
+    }
+    /// `lb_8000B1CC(bone, NULL, &out)` (0x8000B1CC) on a bone with a parent:
+    /// HSD_JObjSetupMatrix, then the matrix's translation column.
+    pub fn joint_world_translation(&mut self, bone: usize) -> hsd_types::Vec3 {
+        let m = self.joint_matrix(bone);
+        hsd_types::Vec3::new(m.0[0][3], m.0[1][3], m.0[2][3])
+    }
+    /// `HSD_JObjGetRotation` of a model bone, the whole quaternion.
+    pub fn joint_rotation_quat(&self, bone: usize) -> hsd_anim::quat::Quaternion {
+        self.tree.rotation(self.joints[bone])
+    }
+    /// The bones under `bone` (HSD_JObjGetChild, then HSD_JObjGetNext), in
+    /// sibling order.
+    pub fn child_bones(&self, bone: usize) -> Vec<usize> {
+        self.tree
+            .children(self.joints[bone])
+            .map(|id| {
+                self.joints
+                    .iter()
+                    .position(|&joint| joint == id)
+                    .expect("a model bone's child is a model bone")
+            })
+            .collect()
+    }
+    /// `HSD_JObjSetRotation` on the Ground GObj's JObj, the whole quaternion.
+    pub fn set_gobj_rotation_quat(&mut self, rotation: &hsd_anim::quat::Quaternion) {
+        let joint = self.tree.parent(self.root).unwrap_or(self.root);
+        self.tree.set_rotation(joint, rotation);
+    }
+    /// `HSD_JObjGetFlags(bone) & JOBJ_HIDDEN`.
+    pub fn joint_hidden(&self, bone: usize) -> bool {
+        self.tree.flags(self.joints[bone]) & hsd_anim::jobj::JOBJ_HIDDEN != 0
+    }
+    /// `HSD_JObjSetFlagsAll` / `HSD_JObjClearFlagsAll(bone, JOBJ_HIDDEN)`.
+    pub fn set_joint_hidden(&mut self, bone: usize, hidden: bool) {
+        let joint = self.joints[bone];
+        if hidden {
+            self.tree.set_flags_all(joint, hsd_anim::jobj::JOBJ_HIDDEN);
+        } else {
+            self.tree
+                .clear_flags_all(joint, hsd_anim::jobj::JOBJ_HIDDEN);
+        }
+    }
+    /// `HSD_JObjSetTranslate` on the Ground GObj's JObj (the map-scale wrapper).
+    pub fn set_gobj_translate(&mut self, translate: hsd_types::Vec3) {
+        let joint = self.tree.parent(self.root).unwrap_or(self.root);
+        self.tree.set_translate(joint, &translate);
+    }
+    /// `HSD_JObjSetScale` on the Ground GObj's JObj (the map-scale wrapper).
+    pub fn set_gobj_scale(&mut self, scale: hsd_types::Vec3) {
+        let joint = self.tree.parent(self.root).unwrap_or(self.root);
+        self.tree.set_scale(joint, &scale);
+    }
+    /// The world matrix of a model bone and its orientation target, as an
+    /// RObj constraint on another model's joint reads them (robj.c).
+    pub fn joint_target(&mut self, bone: usize) -> (hsd_types::Mtx, hsd_anim::orientation::OrientationTarget) {
+        let joint = self.joints[bone];
+        let target = self.tree.orientation_target(joint);
+        (*self.tree.get_mtx(joint), target)
+    }
+    /// Reserve bone `bone`'s RObj constraint slots before the tick loop.
+    pub fn reserve_constraint(&mut self, bone: usize) {
+        let joint = self.joints[bone];
+        self.tree.reserve_position_constraint(joint);
+        self.tree.reserve_orientation_constraint(joint);
+    }
+    /// `lb_8000C2F8(bone, target)` (0x8000C2F8) as the constraint resolves
+    /// now: bone `bone` takes the target's world position and orientation
+    /// (`None` removes both).
+    pub fn constrain_joint<T: hsd_anim::mtx::InverseTrig>(
+        &mut self,
+        bone: usize,
+        target: Option<(hsd_types::Mtx, hsd_anim::orientation::OrientationTarget)>,
+    ) {
+        let joint = self.joints[bone];
+        match target {
+            Some((matrix, orientation)) => {
+                let position = hsd_types::Vec3::new(matrix.0[0][3], matrix.0[1][3], matrix.0[2][3]);
+                self.tree.set_position_constraint(joint, Some(position));
+                self.tree.set_orientation_constraint(
+                    joint,
+                    Some((orientation, hsd_anim::mtx::hsd_mtx_get_rotation::<T>)),
+                );
+            }
+            None => {
+                self.tree.set_position_constraint(joint, None);
+                self.tree.set_orientation_constraint(joint, None);
+            }
+        }
+    }
+    /// HSD_JObjSetRotation on the actual Ground GObj root (the wrapper).
+    pub fn set_gobj_rotation(&mut self, rotation: hsd_types::Vec3) {
+        let joint = self.tree.parent(self.root).unwrap_or(self.root);
+        self.tree.set_rotation_x(joint, rotation.x);
+        self.tree.set_rotation_y(joint, rotation.y);
+        self.tree.set_rotation_z(joint, rotation.z);
+    }
+    pub fn gobj_rotation(&self) -> hsd_types::Vec3 {
+        let node = self
+            .tree
+            .get(self.tree.parent(self.root).unwrap_or(self.root));
+        hsd_types::Vec3::new(node.rotate.x, node.rotate.y, node.rotate.z)
+    }
+    pub fn gobj_matrix(&mut self) -> hsd_types::Mtx {
+        let joint = self.tree.parent(self.root).unwrap_or(self.root);
+        self.tree.setup_matrix(joint);
+        self.tree.get(joint).mtx
+    }
+    /// `HSD_JObjGetTranslation` of the Ground GObj's JObj.
+    pub fn gobj_translation(&self) -> hsd_types::Vec3 {
+        self.tree
+            .translation(self.tree.parent(self.root).unwrap_or(self.root))
+    }
+    /// `HSD_JObjGetScale` / `HSD_JObjSetScale` on the Ground GObj's JObj.
+    pub fn gobj_scale(&self) -> hsd_types::Vec3 {
+        let node = self.tree.get(self.tree.parent(self.root).unwrap_or(self.root));
+        hsd_types::Vec3::new(node.scale.x, node.scale.y, node.scale.z)
+    }
+    pub fn joint_count(&self) -> usize {
+        self.joints.len()
+    }
+    pub fn set_background_rotation(&mut self, pitch: f32, yaw: f32) {
+        self.tree.set_rotation_x(self.root, pitch);
+        self.tree.set_rotation_y(self.root, yaw);
+    }
+    /// Saved stage clocks have already evaluated their current frame.
+    pub fn restore_joint_clock<T: hsd_anim::mtx::InverseTrig>(&mut self, bone: usize, frame: f32) {
+        let joint: JObjId = self.joints[bone];
+        if self.tree.get(joint).aobj.is_none() {
+            return;
+        }
+        for _ in 0..=frame as usize {
+            self.tree
+                .anim::<T>(joint, &mut hsd_anim::aobj::AObjEndCallback::default());
+        }
+        self.tree.events.clear();
+    }
+}
+
+impl BackgroundAnimation {
+    /// Prepared programs for one display object, across all stage phases.
+    pub fn material_programs(
+        &self,
+        joint: JObjId,
+        display: usize,
+    ) -> impl Iterator<Item = &hsd_anim::material_playback::PreparedMaterial> {
+        let slot = self.joints.iter().position(|&id| id == joint);
+        self.prepared_materials.iter().filter_map(move |programs| {
+            programs
+                .get(slot?)
+                .and_then(|materials| materials.get(display))
+        })
+    }
+    pub(super) fn prepare_material_switches(
+        &mut self,
+        archive: &Archive,
+        model: &crate::desc::ModelDesc,
+    ) -> crate::desc::ReadResult<()> {
+        for (index, &offset) in model.material_animation_offsets.iter().enumerate() {
+            let desc = hsd_archive::desc::MatAnimJoint::read(archive, offset)?;
+            let animation = hsd_anim::load::material_animation(archive, &desc)?;
+            let mut programs = Vec::with_capacity(self.joints.len());
+            collect_materials(&self.tree, self.root, Some(&animation), &mut programs);
+            assert_eq!(programs.len(), self.joints.len());
+            for (slot, materials) in programs.iter_mut().enumerate() {
+                if let Some(objects) = self.tree.dobj_mut(self.joints[slot]) {
+                    for (object, program) in objects.iter_mut().zip(materials) {
+                        if let Some(material) = &mut object.mobj {
+                            program.set_loop(model.animation_loops.get(index) == Some(&true));
+                            program.reserve(material);
+                        }
+                    }
+                }
+            }
+            self.prepared_materials.push(programs);
+        }
+        Ok(())
+    }
+    pub(super) fn play_materials(&mut self, index: usize, start: usize, end: usize) {
+        let Some(programs) = self.prepared_materials.get(index) else {
+            return;
+        };
+        for (slot, materials) in programs.iter().enumerate().take(end).skip(start) {
+            if let Some(objects) = self.tree.dobj_mut(self.joints[slot]) {
+                for (object, program) in objects.iter_mut().zip(materials) {
+                    if let Some(material) = &mut object.mobj {
+                        program.apply(material, 0.0);
+                    }
+                }
+            }
+        }
+    }
+}
+fn collect_materials(
+    tree: &hsd_anim::jobj::JObjTree,
+    joint: JObjId,
+    animation: Option<&hsd_anim::jobj::MatAnimJoint>,
+    output: &mut Vec<Vec<hsd_anim::material_playback::PreparedMaterial>>,
+) {
+    use hsd_anim::material_playback::PreparedMaterial;
+    output.push(animation.map_or_else(Vec::new, |a| {
+        a.matanim.iter().map(PreparedMaterial::new).collect()
+    }));
+    let mut child = tree.get(joint).child;
+    let mut animations = animation.map(|a| a.children.iter());
+    while let Some(id) = child {
+        collect_materials(
+            tree,
+            id,
+            animations.as_mut().and_then(Iterator::next),
+            output,
+        );
+        child = tree.get(id).next;
+    }
+}

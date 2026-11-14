@@ -1,0 +1,442 @@
+//! Immutable effect definitions, separated from per-match animation slots.
+use super::*;
+use std::sync::Arc;
+
+/// One character row of efAsync_DatEntries (efasync.c:1209-1260) the port
+/// loads: its particle bank number (the row index), file, table symbol and
+/// the model ids its table rows take (`bank * 1000 + row`).
+#[derive(Clone, Copy, Debug)]
+pub struct CharacterEffectFile {
+    pub bank: u8,
+    pub file: &'static str,
+    pub table: &'static str,
+    pub models: u32,
+}
+impl CharacterEffectFile {
+    pub const fn first_model(&self) -> u32 {
+        self.bank as u32 * 1000
+    }
+}
+
+/// Character effect files loaded with every scene, in bank order.
+pub const CHARACTER_EFFECT_FILES: [CharacterEffectFile; 33] = [
+    // Mario (efAsync_DatEntries[1]): model 0x3E8, the fireball's hand flash
+    // (efAlt 0x47A), and 0x3E9, the Tornado's (efAlt 0x47C).
+    CharacterEffectFile {
+        bank: 1,
+        file: "EfMrData.dat",
+        table: "effMarioDataTable",
+        models: 2,
+    },
+    // Samus (efAsync_DatEntries[2]): models 0x7D0..0x7D2 (efAlt 0x482,
+    // 0x486, 0x487).
+    CharacterEffectFile {
+        bank: 2,
+        file: "EfSsData.dat",
+        table: "effSamusDataTable",
+        models: 3,
+    },
+    CharacterEffectFile {
+        bank: 3,
+        file: "EfFxData.dat",
+        table: "effFoxDataTable",
+        models: 6,
+    },
+    CharacterEffectFile {
+        bank: 4,
+        file: "EfCaData.dat",
+        table: "effCaptainDataTable",
+        models: 6,
+    },
+    // Kirby (efAsync_DatEntries[5]): models 0x1388..0x1390 (efAlt 0x494 and
+    // on: the Final Cutter, Stone, hammer and swallow effects).
+    CharacterEffectFile {
+        bank: 5,
+        file: "EfKbData.dat",
+        table: "effKirbyDataTable",
+        models: 9,
+    },
+    // Link and Young Link (efAsync_DatEntries[6]): models 0x1770..0x1773,
+    // the spin attack's ground and air swirls (efSync 0x4BB/0x4BC).
+    CharacterEffectFile {
+        bank: 6,
+        file: "EfLkData.dat",
+        table: "effLinkDataTable",
+        models: 4,
+    },
+    // Models 0x1B58..0x1B5C (efSync 0x4BD..0x4C5): the jolt, Skull Bash
+    // and Thunder effects.
+    CharacterEffectFile {
+        bank: 7,
+        file: "EfPkData.dat",
+        table: "effPikachuDataTable",
+        models: 5,
+    },
+    // Donkey Kong (efAsync_DatEntries[8]): models 0x1F40..0x1F46 (efSync
+    // 0x4C6..0x4CC, efsync.c:164-222): Headbutt, Giant Punch, Spinning Kong
+    // and Hand Slap.
+    CharacterEffectFile {
+        bank: 8,
+        file: "EfDkData.dat",
+        table: "effDonkeyDataTable",
+        models: 7,
+    },
+    // Particles only: the Egg Throw burst's generator 0x2328 (efsync.c:225).
+    CharacterEffectFile {
+        bank: 9,
+        file: "EfYsData.dat",
+        table: "effYoshiDataTable",
+        models: 0,
+    },
+    // Ness (efAsync_DatEntries[10]): models 0x2710..0x2712 (efSync
+    // 0x4EE..0x4F0, efsync.c:292-301); no particles.
+    CharacterEffectFile {
+        bank: 10,
+        file: "EfNsData.dat",
+        table: "effNessDataTable",
+        models: 3,
+    },
+    // Sing's notes, model 0x2AF8 (efsync.c:305-308).
+    CharacterEffectFile {
+        bank: 11,
+        file: "EfPrData.dat",
+        table: "effPurinDataTable",
+        models: 1,
+    },
+    // Bowser (efAsync_DatEntries[12]): models 0x2EE0..0x2EE2, the Bowser
+    // Bomb's landing and drop and the Whirling Fortress (efSync 0x4D8,
+    // 0x4DA, 0x4DF).
+    CharacterEffectFile {
+        bank: 12,
+        file: "EfKpData.dat",
+        table: "effKoopaDataTable",
+        models: 3,
+    },
+    // Mewtwo (efAsync_DatEntries[13]): models 0x32C8..0x32CB (efSync
+    // 0x4E0..0x4E2 and 0x4E8, efsync.c:372-413): Shadow Ball's charge,
+    // Confusion, Disable and Teleport.
+    CharacterEffectFile {
+        bank: 13,
+        file: "EfMtData.dat",
+        table: "effMewtwoDataTable",
+        models: 4,
+    },
+    // Particles only: the ice block's generators 0x36B0..0x36B7
+    // (efsync.c:414-425).
+    CharacterEffectFile {
+        bank: 14,
+        file: "EfIcData.dat",
+        table: "effIceclimberDataTable",
+        models: 0,
+    },
+    // Model 0x3A98 (efSync 0x4D2): the vegetable pull.
+    CharacterEffectFile {
+        bank: 15,
+        file: "EfPeData.dat",
+        table: "effPeachDataTable",
+        models: 1,
+    },
+    CharacterEffectFile {
+        bank: 16,
+        file: "EfMsData.dat",
+        table: "effMarsDataTable",
+        models: 2,
+    },
+    // Zelda's and Sheik's shared file (ftData_UnkBytePerCharacter 17):
+    // its particles (e.g. the transformation's generators 0x426D / 0x4271,
+    // efSync 0x4FC / 0x4FD) and models 0x4268..0x4271 (efSync 0x4F4..0x501);
+    // a row without a model is skipped.
+    CharacterEffectFile {
+        bank: 17,
+        file: "EfZdData.dat",
+        table: "effZeldaDataTable",
+        models: 10,
+    },
+    // Luigi (efAsync_DatEntries[18]): model 0x4650, the fireball's hand
+    // flash (efSync 0x507), and 0x4651, the Cyclone's (efSync 0x509).
+    CharacterEffectFile {
+        bank: 18,
+        file: "EfLgData.dat",
+        table: "effLuigiDataTable",
+        models: 2,
+    },
+    // Models 0x4A38..0x4A3D (efSync 0x50B..0x50F): Warlock Punch, Wizard's
+    // Foot and Gerudo Dragon.
+    CharacterEffectFile {
+        bank: 19,
+        file: "EfGnData.dat",
+        table: "effGanonDataTable",
+        models: 6,
+    },
+    // Kirby's copied Shield Breaker (efAsync_DatEntries[20],
+    // ftKb_Init_803CB46C for Marth): models 0x4E20 / 0x4E21, the release's
+    // trail on the ground and in the air (efAlt 0x4B4 / 0x4B5).
+    CharacterEffectFile {
+        bank: 20,
+        file: "EfKbMs.dat",
+        table: "effKirbyMarsDataTable",
+        models: 2,
+    },
+    // Kirby's copied Nayru's Love (efAsync_DatEntries[21],
+    // ftKb_Init_803CB46C for Zelda): models 0x5208 / 0x5209, the crystal on
+    // the ground and in the air (efAlt 0x4B6 / 0x4B7).
+    CharacterEffectFile {
+        bank: 21,
+        file: "EfKbZd.dat",
+        table: "effKirbyZeldaDataTable",
+        models: 2,
+    },
+    // Kirby's copied Fireball and Megavitamin (efAsync_DatEntries[32],
+    // ftKb_Init_803CB46C for Mario and Dr. Mario): model 0x7D00, the
+    // fireball's hand flash (efAlt 0x49F), and generator 0x7D02, its bounce
+    // (efAlt 0x4A0).
+    CharacterEffectFile {
+        bank: 32,
+        file: "EfKbMr.dat",
+        table: "effKirbyMarioDataTable",
+        models: 1,
+    },
+    // Kirby's copied Blasters (efAsync_DatEntries[33], ftKb_Init_803CB46C
+    // for Fox and Falco, loaded with a Kirby facing either): model 0x80E8,
+    // the shot's flash (efAlt 0x4AC).
+    CharacterEffectFile {
+        bank: 33,
+        file: "EfKbFx.dat",
+        table: "effKirbyFoxDataTable",
+        models: 1,
+    },
+    // Kirby's copied Charge Shot (efAsync_DatEntries[34], ftKb_Init_803CB46C
+    // for Samus): model 0x84D0, the muzzle flash (efAlt 0x4A4), and the
+    // shot's generators 0x84D2..0x84D4 (efAlt 0x4A1..0x4A3).
+    CharacterEffectFile {
+        bank: 34,
+        file: "EfKbSs.dat",
+        table: "effKirbySamusDataTable",
+        models: 1,
+    },
+    // Kirby's copied Thunder Jolt (efAsync_DatEntries[36],
+    // ftKb_Init_803CB46C for Pikachu and Pichu): no models; its particle
+    // kind 0x8CA0 is the ball's trail (efAlt 0x4AD).
+    CharacterEffectFile {
+        bank: 36,
+        file: "EfKbPk.dat",
+        table: "effKirbyPikachuDataTable",
+        models: 0,
+    },
+    // Kirby's copied green Fireball (efAsync_DatEntries[37],
+    // ftKb_Init_803CB46C for Luigi): model 0x9088, the hand flash (efAlt
+    // 0x4B1), and generator 0x908A, the bounce (efAlt 0x4B2).
+    CharacterEffectFile {
+        bank: 37,
+        file: "EfKbLg.dat",
+        table: "effKirbyLuigiDataTable",
+        models: 1,
+    },
+    // Kirby's copied Falcon Punch (efAsync_DatEntries[38],
+    // ftKb_Init_803CB46C for Captain Falcon): models 0x9470 and 0x9471, the
+    // punch's pair (efAlt 0x4AB).
+    CharacterEffectFile {
+        bank: 38,
+        file: "EfKbCa.dat",
+        table: "effKirbyCaptainDataTable",
+        models: 2,
+    },
+    // Kirby's copied Giant Punch (efAsync_DatEntries[39], ftKb_Init_803CB46C
+    // for Donkey Kong): models 0x9858 / 0x9859, the punch on the ground and
+    // in the air (efAlt 0x4A9 / 0x4AA).
+    CharacterEffectFile {
+        bank: 39,
+        file: "EfKbDk.dat",
+        table: "effKirbyDonkeyDataTable",
+        models: 2,
+    },
+    // Kirby's copied Fire Breath (efAsync_DatEntries[41],
+    // ftKb_Init_803CB46C for Bowser): generators 0xA028..0xA02B, the
+    // flames (efAlt 0x4A5..0x4A8); no models.
+    CharacterEffectFile {
+        bank: 41,
+        file: "EfKbKp.dat",
+        table: "effKirbyKoopaDataTable",
+        models: 0,
+    },
+    // Kirby's copied Ice Shot (efAsync_DatEntries[46], ftKb_Init_803CB46C
+    // for the Ice Climbers): generators 0xB3B0, 0xB3B1 and 0xB3B6, the
+    // block made, launched and sliding (efAlt 0x4AE..0x4B0); no models.
+    CharacterEffectFile {
+        bank: 46,
+        file: "EfKbIc.dat",
+        table: "effKirbyIceDataTable",
+        models: 0,
+    },
+    // Kirby's copied Warlock Punch (efAsync_DatEntries[47], for Ganondorf):
+    // models 0xB798 and 0xB799 (efAlt 0x4B3).
+    CharacterEffectFile {
+        bank: 47,
+        file: "EfKbGn.dat",
+        table: "effKirbyGanonDataTable",
+        models: 2,
+    },
+    // Kirby's copied Flare Blade (efAsync_DatEntries[48],
+    // ftKb_Init_803CB46C for Roy): models 0xBB80 / 0xBB81, the release's
+    // flame on the ground and in the air (efAlt 0x4B8 / 0x4B9).
+    CharacterEffectFile {
+        bank: 48,
+        file: "EfKbFe.dat",
+        table: "effKirbyEmblemDataTable",
+        models: 2,
+    },
+    // Models 0xBF68..0xBF69 (efSync 0x510..0x512, efsync.c:642-652): Roy's
+    // Counter flash and Flare Blade release.
+    CharacterEffectFile {
+        bank: 49,
+        file: "EfFeData.dat",
+        table: "effEmblemDataTable",
+        models: 2,
+    },
+];
+
+/// Particle banks of `CHARACTER_EFFECT_FILES`, in the same order.
+pub(super) type CharacterBanks = [Option<ParticleBank>; CHARACTER_EFFECT_FILES.len()];
+
+/// The particle banks an effect's DPtcl events and spawns select from.
+#[derive(Clone, Copy)]
+pub(super) struct Banks<'a> {
+    pub common: &'a ParticleBank,
+    pub characters: &'a CharacterBanks,
+}
+impl<'a> Banks<'a> {
+    /// The bank a particle id's high part names (efLib_SpawnParticleEffect).
+    pub fn get(&self, bank: i32) -> Result<&'a ParticleBank> {
+        if bank == 0 {
+            return Ok(self.common);
+        }
+        character_bank(self.characters, bank)
+    }
+}
+pub(super) fn character_bank(banks: &CharacterBanks, bank: i32) -> Result<&ParticleBank> {
+    CHARACTER_EFFECT_FILES
+        .iter()
+        .position(|file| i32::from(file.bank) == bank)
+        .and_then(|index| banks[index].as_ref())
+        .with_context(|| format!("effect particle bank {bank} not loaded"))
+}
+pub(super) fn is_character_bank(bank: u8) -> bool {
+    CHARACTER_EFFECT_FILES.iter().any(|file| file.bank == bank)
+}
+
+/// ftData_UnkBytePerCharacter (ftdata.c:1514), indexed by FighterKind: the
+/// efAsync_DatEntries row Fighter_Create loads for each kind (-1: none).
+pub const FIGHTER_EFFECT_BANKS: [i8; 33] = [
+    1, 3, 4, 8, 5, 12, 6, 17, 10, 15, 14, 14, 7, 2, 9, 11, 13, 18, 16, 17, 6, 1, 3, 7, -1, 19, 49,
+    -1, -1, -1, -1, 12, -1,
+];
+
+#[derive(Clone)]
+pub struct Resources {
+    pub(super) models: Vec<Arc<Effect>>,
+    pub(super) character_banks: CharacterBanks,
+    /// efAsync_DatEntries rows the match's fighters loaded, one bit each
+    /// (`with_fighters`).
+    pub(super) loaded_banks: u64,
+}
+impl Resources {
+    /// `characters` holds the archives of `CHARACTER_EFFECT_FILES`, in order.
+    pub fn load(
+        common: &Archive,
+        characters: &[Archive; CHARACTER_EFFECT_FILES.len()],
+    ) -> Result<Self> {
+        let mut models = pool::load_common(common)?;
+        let mut character_banks: CharacterBanks = std::array::from_fn(|_| None);
+        for ((file, archive), slot) in CHARACTER_EFFECT_FILES
+            .iter()
+            .zip(characters)
+            .zip(&mut character_banks)
+        {
+            let (bank, bank_models) = character(archive, file)?;
+            models.extend(bank_models);
+            *slot = Some(bank);
+        }
+        Ok(Self {
+            models,
+            character_banks,
+            loaded_banks: 0,
+        })
+    }
+    /// Fighter_Create's efAsync_LoadSync(ftData_UnkBytePerCharacter[kind])
+    /// for each fighter kind (`melee_types::FighterKind` as i32): which
+    /// banks retail holds (efsync.c:67 tests Mario's).
+    pub fn with_fighters(mut self, kinds: impl IntoIterator<Item = i32>) -> Self {
+        for kind in kinds {
+            let bank = usize::try_from(kind)
+                .ok()
+                .and_then(|kind| FIGHTER_EFFECT_BANKS.get(kind))
+                .copied()
+                .unwrap_or(-1);
+            if bank >= 0 {
+                self.loaded_banks |= 1 << bank;
+            }
+        }
+        self
+    }
+    /// Whether the match can create a model of `bank`: the common bank, a
+    /// bank its fighters loaded (Fighter_Create, fighter.c:864), or any bank
+    /// once a Kirby is present, whose copy abilities load further rows
+    /// mid-match (ftKb_Init_803CB46C, ftkirby.c:2762/2796). A model of any
+    /// other bank needs no pooled slots.
+    pub(super) fn holds(&self, bank: u8) -> bool {
+        bank == 0
+            || self.loaded_banks & (1 << KIRBY_BANK) != 0
+            || self.loaded_banks & (1u64 << bank) != 0
+    }
+}
+/// Kirby's efAsync_DatEntries row (ftData_UnkBytePerCharacter[FTKIND_KIRBY]).
+const KIRBY_BANK: u8 = 5;
+pub(super) fn character(
+    archive: &Archive,
+    file: &CharacterEffectFile,
+) -> Result<(ParticleBank, Vec<Arc<Effect>>)> {
+    let symbol = file.table;
+    let table = archive
+        .public(symbol)
+        .with_context(|| format!("{symbol} effect table"))?;
+    // effPeachDataTable has models only: both particle links are null.
+    let particles = match (archive.link(table)?, archive.link(table + 4)?) {
+        (Some(commands), Some(textures)) => ParticleBank::from_bytes(
+            &archive.data()[commands as usize..textures as usize],
+            &archive.data()[textures as usize..],
+        )?,
+        (None, None) => ParticleBank {
+            version: 0,
+            first_descriptor_id: 0,
+            descriptors: Arc::new([]),
+            textures: Arc::new([]),
+        },
+        // efAsync_OnLoad (efasync.c:1281) would hand psInitDataBankLocate a
+        // lone link, but no effect table on the disc has one: all 36 pair
+        // them (tests/disc_effect_tables.rs, docs/COVERAGE_AUDIT.md).
+        _ => unreachable!("{symbol}: particle commands without textures"),
+    };
+    // A row without a model (EF_EffectDesc.model NULL) names no model id;
+    // effZeldaDataTable has one.
+    let row_model = |index: u32| archive.link(table + 8 + index * 20 + 4);
+    let mut rows = Vec::new();
+    for index in 0..file.models {
+        if row_model(index)?.is_some() {
+            rows.push(index);
+        }
+    }
+    let models = rows
+        .into_iter()
+        .map(|index| {
+            Effect::load_table(
+                archive,
+                symbol,
+                index,
+                file.first_model() + index,
+                file.bank,
+            )
+            .map(Arc::new)
+        })
+        .collect::<Result<_>>()?;
+    Ok((particles, models))
+}

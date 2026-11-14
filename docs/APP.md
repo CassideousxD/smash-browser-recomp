@@ -1,0 +1,453 @@
+# The playable app: one core, native hosts
+
+The game ships as a macOS app and a web page with the same flow: give it a
+Super Smash Bros. Melee NTSC-U 1.02 disc image, pick up to four players
+(human or CPU) and the rules, pick a stage, play, see the results. Nothing is hard-coded: no ISO path, no
+extracted files directory.
+
+The structure follows Ghostty (libghostty plus a native "apprt" per
+platform). A shared Rust core owns all application logic and the
+renderer; each platform host is a thin native layer that draws menus with
+its own toolkit, forwards user intent and gives the core a surface to draw
+the game into. Hosts hold no game or menu rules.
+
+```
+            +-------------------- libmelee (crates/melee-platform) ---------------------+
+            | gc-disc       disc header + FST, validation (sans IO)                     |
+            | disc.rs       DiscFiles: which bytes a match needs; fetched-file cache    |
+            | catalog.rs    character / stage ids, names, costume counts, CSS grid      |
+            | app.rs        App: screen flow, picks, costume rules, config, loading,    |
+            |               match, results, rematch, notices                            |
+            | session.rs    fixed 60 Hz ticks, input latching, pause, recording         |
+            | surface.rs    WindowRenderer: one wgpu device per surface, scene follows  |
+            | renderer.rs   the match renderer (shared with render_frame)               |
+            | preview.rs    stage previews rendered from the disc at runtime            |
+            +-------------------+--------------------------------+----------------------+
+                                |                                |
+               C API (ffi.rs, include/melee_platform.h)   wasm-bindgen (crates/melee-web)
+                                |                                |
+            apps/macos: Swift + AppKit (SwiftUI views)   crates/melee-web/www: HTML/CSS/JS
+            NSWindow, menu bar, open panel, Dock drop,   drop zone, file picker, DOM menus,
+            CAMetalLayer, CADisplayLink, keyboard,       WebGPU canvas, rAF loop, keyboard,
+            GameController pads                          Gamepad API pads
+```
+
+## The flow (`app::App`)
+
+```
+Disc -> Characters -> Stages -> Loading -> Match -> Results
+```
+
+- **Disc.** The host hands the core a disc (natively a path; on the web the
+  header and file-table bytes it read). `gc-disc` accepts only `GALE01`
+  revision 2 and names what it found otherwise: another revision (1.00,
+  1.01), region (PAL, Japanese), game, a Wii disc, or a container format
+  (.zip, .7z, .rvz, .wia, .gcz, .ciso, .wbfs, NKit). A short image fails
+  before any file is read.
+- **Characters.** Four slots (`players.rs`), one per port: human, CPU
+  (level 1-9) or off; slots 1-2 start human. Character ids are indices into
+  `Character::ALL` (the retail CSS reading order; `catalog::grid_cell`
+  gives the retail 9/9/7 grid, Sheik in Kirby's cell). Picking for an off
+  slot joins it; a pick moves to the first costume no other active slot
+  wears, and costume changes skip theirs. A match needs two active slots
+  with characters (two teams in a team battle). Each slot also holds a
+  team colour and a handicap.
+- **Rules** (`players::Rules`, settable on the menu screens): Stock (1-99)
+  or Time (1-99 minutes, with Sudden Death on a tie; a stock match may
+  also have a limit), teams and friendly fire, the Item Switch (off, very
+  low .. very high, every ported kind on: `melee_lib::ported_item_switch`),
+  Damage Ratio and the Special Melee modes the simulator plays (Super
+  Sudden Death, Lightning, Slo-Mo). New modes add a field and a row.
+  `MatchConfig::validate` refuses a combination before loading.
+- **What the simulator witnesses.** CPU players, items and player counts
+  are offered only inside melee-lib's single lists: `Stage::cpu_supported`
+  and `Stage::cpu_max_players` (four on FD and Battlefield, two elsewhere:
+  a CPU's tumble reads its Fighter's address, known for three and four
+  players there only), `Stage::items_supported` (two to four players on
+  every ported stage but Mushroom Kingdom, whose `?` blocks are unported). `App::stage_unavailable` names why
+  a stage cannot host the picks; hosts grey it out with that reason.
+- **Input.** Keyboard layout n drives the match's nth human player; a
+  gamepad drives the port it joined (below, "Gamepads"); CPU ports read
+  nothing and record neutral. A pad reaches the session as GameCube bytes
+  (`input::Gamepad`: stick and C-stick in retail's units, analog triggers up
+  to 140, buttons); the keyboard leads while in use.
+- **Stages.** Choosing one builds the `MatchConfig` with a host-random seed
+  (recorded in the replay) and lists the files to read
+  (`GameAssets::files`, minus those already fetched).
+- **Loading.** The host reads each request's byte range and hands it over
+  (`provide_file`, length-checked against the FST); natively the core
+  reads the image itself, one file per `load_step` so the host can show
+  progress. `finish_loading` builds the session; a failure (a character or
+  stage that cannot be presented yet, a renderer that rejects the scene)
+  returns to stage select with the error as the notice. Fetched files stay
+  cached for the next match (a rematch loads nothing).
+- **Match.** `advance(host time)` runs fixed ticks; the HUD is read each
+  frame. A fault stops the match: natively the replay is saved to the temp
+  directory and the notice names it; the host offers Save Replay. A
+  finished match moves to Results.
+- **Results.** Winner (or draw), final percents and stocks; Rematch (same
+  picks, new seed) or back to character select.
+
+**Menu art** (`art.rs`) comes from the user's disc at runtime, never from
+the repository. After `open_disc` the core asks for `MnSlChr.usd`,
+`MnSlMap.usd` and `IfAll.usd` (about 5 MB; `art_requests`, handed over
+through `provide_file` on any screen; natively `load_art`, which the C
+API's open-disc call runs) and decodes each image on first use, found the
+way the retail menus find it (model, joint, texture animation frame;
+`art/retail.rs` cites the code). Images are RGBA8, straight alpha, native
+size:
+
+| Piece | Size | Notes |
+|---|---|---|
+| Portrait (character, costume) | 136x188 | the select-screen portrait; the best art for a modern menu |
+| Face (character) | 64x56 | grid face with its name plate |
+| Stock (character, costume) | 24x24 | in-match stock icon |
+| Character emblem | 80x64 | series emblem, intensity (tint its alpha) |
+| Stage icon | 64x56 | 48x48 for Past Stages (Dream Land); retail has no 2D preview (the stage select shows 3D miniatures) |
+| Stage name | 224x56 | series above the stage name, intensity |
+| Stage emblem | 64x64 | retail's faint watermark (alpha peaks at 119) |
+
+| Stage preview | 1920x1080 | rendered, not decoded (below); opaque, smooth: scale with filtering |
+
+Sheik has no portrait or face (retail picks her through Zelda's); her
+emblem is Zelda's, her stock icons her own. `examples/art_survey.rs` dumps
+every texture of an archive to `target/` for exploring.
+
+**Stage previews** (`preview.rs`, `MELEE_ART_STAGE_PREVIEW`): the disc
+has no 2D stage picture, so the core renders one per stage. The art
+requests also list the files the previews need (about 16 MB: the six
+stages, Jigglypuff twice, the common fighter and effect files; kept in the
+fetched-file cache, so a match on that stage reuses them). Once they are in
+and a surface exists, the core runs a short match per stage (Jigglypuff
+twice, 300 neutral ticks so platforms, water and backgrounds settle;
+Pokemon Stadium stays in its neutral form), builds a stage-only renderer
+(`Renderer::stage_only`: no fighters, items, effects, shadows or sprites;
+the match is only read) and draws it through a per-stage hero framing
+(`preview::framing`: visible width, interest height and a slightly
+elevated pitch, chosen by eye) at 3840x2160, then averages 2x2 blocks in
+linear light to 1920x1080 RGBA8 sRGB. The match and renderer are dropped
+after each image; the six images (8.3 MB each, about 50 MB) stay. It
+runs on the surface's own device: natively on a background thread (0.15 to
+0.3 s per stage on an M-series Mac, about 1.25 s for all six), on the web
+as steps between page tasks (a `MessageChannel` message, which hidden tabs
+do not throttle; 0.4 to 0.7 s per stage in Chrome, 3.4 s for all six, the
+page blocked at most about 0.35 s at a time by one step: posing the scene or
+building the renderer). Until a preview is rendered the art call fails (C)
+or returns null (wasm); a preview that fails stays so and is logged.
+`melee_app_stage_previews_ready` / `stage_previews_ready()` turn
+true when every preview is settled. `examples/stage_previews.rs` writes them to
+`target/` for inspection (never commit them).
+
+Everything above is unit-tested without a GPU (`cargo test -p
+melee-platform`: flow, costume rules, config, caching, art requests) and
+on the real disc (`tests/disc_flow.rs`: open the image, load, play,
+rematch, reuse cache; `tests/disc_art.rs`: every piece's size, distinct
+picks decode to distinct images, determinism; `tests/stage_previews.rs`,
+skipped without a GPU adapter: every preview's size, variety, distinctness
+and determinism, compared in memory).
+
+## The C API
+
+`crates/melee-platform/include/melee_platform.h`, version
+`MELEE_API_VERSION` (5; bump on any incompatible change, hosts check it at
+start). One opaque `melee_app_t` on one thread; plain structs out; static
+strings in catalog structs; calls that can fail return `bool` and leave
+the message in `melee_app_last_error`; user-facing notices come from
+`melee_app_take_notice`. The surface is a `CAMetalLayer` the host owns
+(`melee_app_attach_metal_layer`); `melee_app_frame(width, height)`
+advances by wall time and draws.
+
+The wasm-bindgen API in `crates/melee-web` mirrors it method for method
+(`WebApp`), returning plain JS objects instead of structs, plus
+`fst_range(header)` and `create_surface(canvas)` for the async parts.
+
+## macOS (`apps/macos`)
+
+```sh
+tools/run-macos.sh          # builds target/macos/Melee.app and launches it, no arguments
+```
+
+`tools/build-macos.sh` builds the static library and compiles the Swift
+files with the C header as the bridging header. The app: an NSWindow with
+the standard menu bar (File: Open Disc, Open Recent, Save Replay; Match:
+Pause, Restart, Quit to Character Select; Window; Help), drag and drop of
+the image onto the window or the Dock icon, recent discs kept as bookmarks
+in UserDefaults. The menus (docs/DESIGN.md) are SwiftUI views in an
+`NSHostingView` above a Core Animation backdrop and the `CAMetalLayer` view,
+drawing the disc's art; the Barlow fonts are registered from the bundle.
+Notices and load errors are glass cards; a match fault is a sheet that
+offers Save Replay. One file per screen: `DiscScreen.swift`,
+`CharacterSelect.swift`, `StageSelect.swift`, `MatchScreens.swift`
+(loading, HUD, pause, results); `Theme.swift` holds the tokens and
+components, `Navigation.swift` the keyboard and pad paths (`MenuKey`),
+`Focus.swift` menu focus (`.padFocus`), `Gamepads.swift` the pad hardware
+(GameController and Wii U GameCube adapters over IOHID), `PadCore.swift`
+the Swift face of `melee_app_pad_*`, `PadViews.swift` the controllers card,
+the app menu, pad hints and the join toast.
+
+Development smoke test (walks the menus, prints the HUD, exits 0 when the
+match is running):
+
+```sh
+MELEE_APP_AUTOSTART=$PWD/harness/roms/GALE01.iso:Fox:Marth:FinalDestination \
+MELEE_APP_SMOKE_SECONDS=5 target/macos/Melee.app/Contents/MacOS/Melee
+```
+
+Fewer fields stop earlier (`iso` at character select, `iso:P1:P2` with the
+picks made). Keys are the catalog's (`CaptainFalcon`, `FinalDestination`).
+With `MELEE_APP_SMOKE_SECONDS` set it also prints the art sizes and, once
+the stage previews are rendered, `previews: ready after N s` with their
+sizes (the core logs each preview's time on stderr).
+`MELEE_APP_PRINT_WINDOW=1` prints the window id for `screencapture -l`.
+
+For screenshots: `MELEE_APP_WINDOW_SIZE=1280x800` sizes the window;
+`MELEE_APP_SCREEN` stops on a screen (`disc-empty`, `disc` with the disc
+open, `stages` with `iso:P1:P2`, `loading` held, `pause` or `results` over
+the running match after `MELEE_APP_SCREEN_DELAY` seconds; results are a
+preview with P1 winning); `MELEE_APP_PREVIEW_PERCENTS=57,142` shows those
+HUD percents. `MELEE_APP_KEYS=right,down,enter,tab,e,...` feeds menu keys
+to the model 0.25 s apart and prints the cursor after each.
+`MELEE_APP_CLICK=x,y` (fractions of the window content, top-left origin;
+several as `x,y;x,y;...`, one per `MELEE_APP_CLICK_INTERVAL` seconds,
+default 1) delivers real left clicks to the window and prints after each
+the screen, whether a sheet opened, the rules, the slots and the live HUD: it exercises hit-testing, which `MELEE_APP_KEYS`
+bypasses (e.g. `0.438,0.758` is Open Disc… at 1280x800 with a recent disc).
+Focus frames (and so `MELEE_APP_PADS_TRACE`'s target list) are measured
+below the title bar's safe area: at 1280x800 the top bar's buttons sit near
+y = 0.1075 (Rules at `0.825,0.1075`, Controllers at `0.923,0.1075`).
+Never test with global synthetic events (`osascript` key codes, `CGEvent`):
+they reach whatever app is frontmost.
+
+`MELEE_APP_PADS=a,2:a,right,a,...` is the pad-only walk: two scripted pads
+(a Switch Pro Controller and a DualSense, handles from
+`Gamepads.virtualBase`) are reported to the core every poll like hardware,
+so the walk goes through the core's mapping, joining and repeat and the
+window's real dispatch (`WindowController.padEvents`). Each step taps one
+control for one poll on pad 1 (`2:x` on pad 2): `a b x y` by position
+(bottom, left, right, top), `z l r start select home`, `up down left right`
+(D-pad), `stick-up` and the like, `wait` or `wait:N` seconds; one step per
+`MELEE_APP_PADS_INTERVAL` seconds (default 0.4). After each step it prints
+the screen, focus, picking player, open cards, rules, slots, pad ports and
+(on the controllers card) the edited pad's bindings; `MELEE_APP_PADS_TRACE=1`
+adds each key handled and the focus targets; `MELEE_APP_PADS_EXIT=1` quits
+after the walk. It runs alongside `MELEE_APP_SCREEN` (e.g. `results` over a
+running match). A window another app covers gets no display frames, so a
+walk through a running match needs the window visible.
+
+## Web (`crates/melee-web`)
+
+```sh
+tools/run-web.sh            # builds target/web and serves http://localhost:8080
+tools/run-web.sh --build    # build only
+```
+
+WebGPU only: the renderer reads storage buffers in the vertex stage, which
+WebGL lacks. Without `navigator.gpu` the page says so. The disc never
+leaves the machine: the page reads the header, the file table and then only
+the files a match needs (about 15 MB) with `Blob.slice()`. In Chromium the
+last disc is remembered as a File System Access handle in IndexedDB (the
+handle, not the file); other browsers ask again after a reload.
+
+The build drops `split-debuginfo` for wasm32 (target rustflags in
+`.cargo/config.toml`) and installs the wasm-bindgen CLI whose version equals
+the `wasm-bindgen` crate in `Cargo.lock` under `target/tools` (never
+`~/.cargo/bin`). `wasm-opt` runs if installed.
+
+Development: `tools/run-web.sh --disc harness/roms/GALE01.iso` also serves
+the image read-only at `/disc.iso` (with HTTP Range), and
+`http://localhost:8080/?disc=disc.iso&autostart=Fox:Marth:FinalDestination`
+walks the menus (`autostart=Fox:Marth` stops at character select).
+`&pads=a,2:a,right,...` is the pad-only walk (`pads.js` `FakePads`: the same
+two scripted pads and steps as macOS's `MELEE_APP_PADS`, one per
+`padInterval` ms, default 400), logging the state after each step to the
+console (`pad <step>: screen ... focus ...`) and setting
+`window.meleePadWalkDone`. Headless Chrome runs it with WebGPU:
+`"Google Chrome" --headless=new --enable-unsafe-webgpu --enable-logging=stderr
+--window-size=1280,800 "http://127.0.0.1:8080/?disc=disc.iso&pads=..."`,
+the console lines on stderr.
+
+## Gamepads
+
+The core maps every pad (`melee-platform/src/pads`, C `melee_app_pad_*`,
+wasm `WebApp.pad_*`); the hosts only read hardware and draw.
+
+- **Reading.** Each host reports every connected pad in the W3C standard
+  layout (`melee_raw_pad_s`: 17 controls by position, four axes, up
+  positive) every display frame on every screen: macOS from
+  GameController (`buttonA` is the bottom face button on every pad) and Wii
+  U GameCube adapters (WUP-028, opened over IOHID, started with 0x13; the
+  core parses the 37-byte report, four ports as pads `base..base+3`), the
+  web from the Gamepad API (`Gamepad.index` is the handle; a pad without
+  the standard mapping is read in its own order and can be rebound). A menu
+  timer polls at 60 Hz on macOS; a running match also polls from its display
+  link; the web polls every animation frame.
+- **Families and defaults** (`pads/family.rs`). The family comes from USB
+  ids (the web `Gamepad.id` in Chromium's and Firefox's formats) or names
+  (GameController's `vendorName`/`productCategory`): GameCube, Switch Pro,
+  Joy-Con, DualSense, DualShock 4, Xbox, 8BitDo, generic. Buttons map by
+  position, not label (`pads/mapping.rs`): the bottom face button is A, the
+  left B, the right X, the top Y (a Nintendo pad's A is on the right, so its
+  B becomes A; the controllers card says so); bumpers Z, triggers L/R,
+  Start, d-pad. GameCube controllers map one to one.
+- **Calibration** (`pads/calibration.rs`). A radial deadzone, then the
+  GameCube's octagonal gate (Dolphin's 87 main / 74 C radii) so full tilt
+  reaches Melee's rim and a diagonal notch reads (0.7, 0.7) through
+  `normalize_stick`. Analog triggers give the analog shield value; the L/R
+  click comes at the pad's trigger click point, and a trigger that only
+  reports pressed is a full press. GameCube sticks are taken one to one
+  around their resting origin.
+- **Joining.** On character select a pad without a port joins on its first
+  button press (`MELEE_MENU_JOINED`, which consumes the press): the first
+  human slot without a pad, else the first slot sitting out (which becomes
+  human). In a match a pad that never joined takes the first human port
+  without a pad. The controllers card assigns ports by hand (a pad already
+  on the port trades places).
+- **Settings, saved per controller** (identity = family, USB ids, name):
+  rebind any control (the control that had the target takes the old job;
+  listening waits 5 s for a new press), swap A and B, stick deadzone,
+  trigger click, reset to the family's defaults. The core encodes them
+  (`melee_app_pad_prefs`); macOS keeps the text in UserDefaults
+  (`padPrefs`), the web in `localStorage` (`melee.padPrefs`, every access in
+  try/catch).
+- **Menu events** (`pads/nav.rs`): directions from the d-pad or the stick
+  (with hysteresis), repeating after 400 ms every 90 ms as Melee's menus
+  do; button presses as edges; Select or Home (unbound) is `MENU`.
+- **Focus** (`focus.rs`, `melee_focus_next`/`focus_next`): each host hands
+  over the frames of the focusable controls of the top layer (an open card
+  or dialog, else the pause card, else the screen) and the core picks the
+  neighbour: the nearest ahead, sideways distance weighted three times;
+  left and right stay in the row and wrap, up and down stop at the edge.
+  Focus is always drawn (macOS rings; the web marks `body.pad-nav` so the
+  focused control shows its ring after a script focus). A key pressed
+  before a card's controls report in waits for them (macOS
+  `AppModel.pendingKey`, at most a second).
+
+## Pad parity
+
+Everything the keyboard does in either app, a pad does; no keyboard or mouse
+is needed from launch to quit (user requirement, 2026-10-25). Pad buttons
+below are GameCube names (by position on other pads: A bottom, B left, X
+right, Y top; Z the right bumper; L/R the triggers).
+
+Menu keys, both hosts (macOS `WindowController.menuKey` and
+`AppModel.handle`; web `app.js` `menuKey` and the keydown handler):
+
+| Keyboard | Does | Pad |
+|---|---|---|
+| ← → ↑ ↓ (macOS also W A S D) | move focus, the grid and stage cursors | D-pad or left stick |
+| Return, Enter, Space (macOS) / Enter (web) | press the focused control; on the grid pick (when ready, go to stage select) | A |
+| Esc | back: character select to the disc screen, stage select and loading back, results to character select; close a card; resume a paused match | B (on character select B first takes the pick back, as in Melee); Start also closes cards and resumes |
+| Tab / Shift-Tab | next / previous player picking (stage select: next / previous stage; macOS controllers card: next / previous pad) | R / L (also the next / previous pad on the controllers card) |
+| Q or [ / E or ] | previous / next costume of the player picking | Y / X |
+| Backspace, Delete | clear the pick of the player picking | B (with a pick) |
+| - / = | fewer / more stocks (minutes in a Time match) | the top bar's ◀ ▶ (focus, A) |
+| (none) | ready to fight from anywhere on character select; rematch on results | Start |
+| (none) | the app menu | Z, Select or Home |
+
+In a match: the keyboard layouts are controllers (WASD, K, J, Space, L, I
+and arrows, N, M, comma, period, slash); a pad is its port's GameCube
+controller. Esc pauses and resumes; any pad's Start does too, and
+Select/Home pauses and opens the app menu. While paused the pad moves
+among Resume, Restart, Save Replay and Quit to Character Select (A presses,
+B or Start resumes, Z the app menu); results offer Rematch, Character
+Select, Stage Select and Save Replay the same way.
+
+macOS menu bar (pads reach the same commands through the app menu or the
+screens):
+
+| Menu bar | Pad |
+|---|---|
+| ⌘O Open Disc… | disc screen Open Disc… (A) opens the panel; the panel itself needs a mouse or keyboard (host limit), B cancels it. Continue and the recent discs are buttons. |
+| Open Recent | the disc screen's recent-disc buttons |
+| ⌘S Save Replay… | pause card or results Save Replay (A): from a pad it saves to `~/Documents/Melee Replays` without a panel and says so |
+| ⌘P Pause / Resume | Start |
+| ⌘R Restart | pause card Restart |
+| ⌘. Quit to Character Select | pause card Quit; results Character Select |
+| ⌘W Close Window, ⌘Q Quit Melee | app menu Quit Melee |
+| ⌘M Minimize, ⌘H Hide Melee, ⌥⌘H Hide Others | app menu Minimize, Hide Melee, Hide Others; Start, A or Select/Home on any pad brings the window back |
+| Show All, Zoom (no keys) | a pad press undoes Hide; Full Screen stands in for Zoom |
+| ⌃⌘F Enter Full Screen | app menu Enter / Exit Full Screen |
+| ⌘? Melee Help | app menu Help (a card; A or B closes it) |
+| About Melee | app menu About |
+| Controllers (character select top bar) | app menu Controllers…, or the top bar button |
+
+Sheets on macOS: a fault sheet answers A or B with its default button
+(Quit to Character Select) and Y with Save Replay… (saved without a
+panel). Behind another app the pads belong to that app: only Start or
+Select/Home brings Melee forward.
+
+Web: the app menu (Z, Select or Home) has Controllers…, Full Screen, Help
+and Close. Host limits: browsers open a file picker, grant a remembered
+disc's permission or enter full screen only right after a click or key
+press, and a gamepad press does not count; Open Disc… from a pad says so.
+Continue (the disc already open) works; dropping a file needs a pointer.
+The page's dialogs (rules, controllers, app menu, messages) take focus, A,
+B and Start like the macOS cards.
+
+### Same bits as native
+
+The simulation on wasm32 must produce the bits native aarch64 does. Three
+std float operations are target-dependent, and the game never uses them:
+
+- **Single-precision fma.** wasm has no fma instruction, so `f32::mul_add`
+  calls musl's `fmaf`, which rounds twice for results in the single
+  subnormal range. `gekko_math::fma` keeps the instruction on aarch64 (and
+  x86_64 with `fma`) and elsewhere computes the exact double product, a
+  TwoSum and a round-to-odd before one conversion to single.
+- **Double fma on WASI.** wasi-libc's `fma` returns `x*y + z` when `z` is
+  zero, losing an underflowed product's sign. `gekko_math::fma` returns the
+  product itself there (`cfg(target_os = "wasi")`); the browser target's
+  compiler-builtins `fma` is already correct.
+- **`max`/`min` of mixed zeros.** Rust leaves `f32::max(+0, -0)`
+  unspecified (aarch64 gives `+0`; wasm follows argument order).
+  `gekko_math::cmp::{max, min}` are retail's `fcmpo`-and-branch clamps,
+  keeping the first argument on a tie; each call site cites the retail
+  comparison it transcribes.
+
+The workspace `clippy.toml` forbids `f32`/`f64` `max`, `min`,
+`minimum`, `maximum`, `mul_add` and the libm functions (`sqrt`, `sin`,
+`powf` and the rest) outside gekko-math; tests that compare against std
+allow them locally.
+
+```sh
+tools/wasm-check.sh               # pure crates' tests under wasmtime, then
+                                  # 3 matches x 2000 ticks hashed native vs wasm
+tools/wasm-check.sh --tests-only
+```
+
+It needs `rustup target add wasm32-wasip1` and a wasmtime binary on `PATH`
+or in `MELEE_WASMTIME` (a release archive from
+github.com/bytecodealliance/wasmtime, unpacked anywhere; the script installs
+nothing). The tests run debug and release (LLVM's folds only appear
+optimized). From a worktree, set `MELEE_DATA_ROOT` to the main checkout for
+the match hash and `MELEE_ALLOW_MISSING_DATA=1` for the crate tests. The
+match hash is `crates/melee-lib/examples/cross_target_hash.rs`: per tick, an
+FNV-1a of `diagnostics::inspect` and `observe`.
+
+## Known limits
+
+- **Panics on the web.** wasm32-unknown-unknown aborts on panic, so the
+  `catch_unwind` in `Match::step` cannot turn an `unimplemented!` into a
+  fault there. The panic hook shows a crash overlay with the message and,
+  when the panic happened inside a tick, a download of that match's
+  replay (`session::panic_replay`), which reproduces the crash natively
+  (`melee-sim`/`Recording::replay`). The page must be reloaded.
+- **Loading blocks briefly.** Building the match (parsing, scene upload)
+  runs on the main thread after the files are read; a few hundred ms.
+- **Input.** Two keyboard layouts; more humans need gamepads. Gamepad
+  hardware not on the development machine is tested through recorded ids
+  and names (`pads/family.rs`) and the scripted walks above.
+- **Rendering.** Every catalog character and stage loads and draws
+  (`tests/render_smoke.rs`, a frame per pick under wgpu validation). A
+  renderer failure still returns to stage select with the error.
+- **Sudden Death.** A timed-out tie continues into `Match::sudden_death`;
+  its replay starts with the Sudden Death (one configuration per replay).
+  One among some of the players is refused by the simulator and stays a
+  draw with a notice.
+- **Art.** The core decodes the menu art and renders the stage previews
+  (above); both bindings hand them out (`melee_app_art`, `WebApp.art`).
+  On the web the preview steps run on the page's thread, so the menus
+  may skip frames for up to about 0.35 s at a time while the previews
+  render (3.4 s after the files are read).
+- The fetched-file cache keeps every file read for the session (about
+  15 MB per new character/stage pair).
