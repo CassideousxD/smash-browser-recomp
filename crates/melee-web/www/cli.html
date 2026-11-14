@@ -237,7 +237,8 @@
     <div class="footer-bar">
       <span id="live-hw">HW Monitor: Initializing Gamepad API…</span>
       <div style="display: flex; gap: 0.4rem; flex-wrap: wrap;">
-        <button class="btn amber" id="btn-xbox" onclick="applyXboxPreset()" title="Instantly apply standard Xbox / PowerA PC mapping">⚡ 1-Click Xbox/PowerA Setup</button>
+        <button class="btn amber" id="btn-custom" onclick="applyUserCustomPreset()" title="Apply X=Attack, A/Y=Jump, B=Special">🔥 X=Attack, A/Y=Jump</button>
+        <button class="btn" id="btn-xbox" onclick="applyXboxPreset()" title="Apply standard Xbox / PowerA mapping (A=Attack, B=Special, X/Y=Jump)">⚡ Default Setup</button>
         <button class="btn" id="btn-zero" onclick="rezeroAxes()" title="Zero resting axes">🎯 Zero Axes</button>
         <button class="btn" id="btn-skip" onclick="skipStep()" title="Skip this input (or press Space)">⏭️ Skip Step</button>
         <button class="btn" id="btn-restart" onclick="restartWizard()">Restart</button>
@@ -253,14 +254,14 @@ const STEPS = [
   { key: 'b', name: 'Special Move (B)', hint: 'Link Bow / Fireball / Recovery (Physical B - Right)', glyph: 'B', buttonsOnly: true },
   { key: 'x', name: 'Jump Button (X)', hint: 'Jump / Short Hop (Physical X - Left)', glyph: 'X', buttonsOnly: true },
   { key: 'y', name: 'Jump Button (Y)', hint: 'Jump / Short Hop (Physical Y - Top)', glyph: 'Y', buttonsOnly: true },
-  { key: 'z', name: 'Grab / Hookshot (Z)', hint: 'Grab opponents & Z-Air Tether (Right Bumper RB or Left Bumper LB)', glyph: 'Z', buttonsOnly: false },
+  { key: 'z', name: 'Grab / Hookshot (Z)', hint: 'Grab opponents & Z-Air Tether (Right Bumper RB or Left Bumper LB)', glyph: 'Z', buttonsOnly: true },
   { key: 'l', name: 'Left Shield (L)', hint: 'Shield / Roll / Air Dodge (Left Trigger LT or Bumper)', glyph: 'L', buttonsOnly: false },
   { key: 'r', name: 'Right Shield (R)', hint: 'Shield / Roll / Air Dodge (Right Trigger RT or Bumper)', glyph: 'R', buttonsOnly: false },
   { key: 'start', name: 'Start / Pause', hint: 'Pause match / Menu Confirm (+ / Start)', glyph: 'Start', buttonsOnly: true },
-  { key: 'dpadUp', name: 'D-Pad UP', hint: 'Directional Pad Up (Taunt / Menu Up)', glyph: '▲', buttonsOnly: false, isDpad: true },
-  { key: 'dpadDown', name: 'D-Pad DOWN', hint: 'Directional Pad Down (Taunt / Menu Down / Crouch)', glyph: '▼', buttonsOnly: false, isDpad: true },
-  { key: 'dpadLeft', name: 'D-Pad LEFT', hint: 'Directional Pad Left (Taunt / Menu Left / Move Left)', glyph: '◀', buttonsOnly: false, isDpad: true },
-  { key: 'dpadRight', name: 'D-Pad RIGHT', hint: 'Directional Pad Right (Taunt / Menu Right / Move Right)', glyph: '▶', buttonsOnly: false, isDpad: true },
+  { key: 'dpadUp', name: 'D-Pad UP', hint: 'Directional Pad Up (Taunt / Menu Up)', glyph: '▲', buttonsOnly: true, isDpad: true },
+  { key: 'dpadDown', name: 'D-Pad DOWN', hint: 'Directional Pad Down (Taunt / Menu Down / Crouch)', glyph: '▼', buttonsOnly: true, isDpad: true },
+  { key: 'dpadLeft', name: 'D-Pad LEFT', hint: 'Directional Pad Left (Taunt / Menu Left / Move Left)', glyph: '◀', buttonsOnly: true, isDpad: true },
+  { key: 'dpadRight', name: 'D-Pad RIGHT', hint: 'Directional Pad Right (Taunt / Menu Right / Move Right)', glyph: '▶', buttonsOnly: true, isDpad: true },
 ];
 
 const state = {
@@ -353,6 +354,31 @@ function showCurrentStep() {
   if (gp) state.baselineAxes = [...gp.axes];
 
   log(`>>> [STEP ${state.stepIndex + 1} of ${STEPS.length}] Press your physical control for: <strong>${s.name}</strong><br><span style="font-size: 0.9rem; color: var(--dim);">${s.hint}</span><span class="cursor"></span>`, 'active');
+}
+
+function applyUserCustomPreset() {
+  const gp = (navigator.getGamepads ? navigator.getGamepads() : []).filter(p => p && p.connected)[0];
+  const padId = gp ? gp.id : 'PowerA Controller';
+  if (!state.pad && gp) state.pad = gp;
+
+  state.bindings = {
+    a: { type: 'button', index: 2 }, // Physical X (Button 2) = Attack
+    b: { type: 'button', index: 1 }, // Physical B (Button 1) = Special
+    x: { type: 'button', index: 0 }, // Physical A (Button 0) = Jump
+    y: { type: 'button', index: 3 }, // Physical Y (Button 3) = Jump
+    z: { type: 'button', index: 5 }, // RB / LB = Grab
+    l: { type: 'button', index: 6 }, // LT = Shield
+    r: { type: 'button', index: 7 }, // RT = Shield
+    start: { type: 'button', index: 9 }, // Start
+    dpadUp: { type: 'button', index: 12 },
+    dpadDown: { type: 'button', index: 13 },
+    dpadLeft: { type: 'button', index: 14 },
+    dpadRight: { type: 'button', index: 15 },
+  };
+
+  log('<br>🔥 <strong>Applied Custom Layout: Physical X = Attack, Physical A & Y = Jump!</strong>', 'cyan');
+  state.stepIndex = STEPS.length;
+  finishCalibration();
 }
 
 function applyXboxPreset() {

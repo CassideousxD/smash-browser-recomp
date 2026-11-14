@@ -1,1 +1,19 @@
-{"id":"PowerA Battle Dragon Wireless Controller for PC and Cloud Gaming  - Adapter (Vendor: 20d6 Product: 4024)","name":"PowerA Battle Dragon Wireless Controller for PC and Cloud Gaming  - Adapter (Vendor: 20d6 Product: 4024)","bindings":{"a":{"type":"button","index":3},"b":{"type":"button","index":1},"x":{"type":"button","index":0},"y":{"type":"button","index":4},"z":{"type":"button","index":6},"l":{"type":"button","index":10},"r":{"type":"button","index":7},"start":{"type":"button","index":11},"dpadUp":{"type":"axis","index":9,"dir":1,"rest":-1.2857142686843872},"dpadDown":{"type":"axis","index":9,"dir":1,"rest":-1.2857142686843872},"dpadLeft":{"type":"axis","index":9,"dir":1,"rest":-1.2857142686843872},"dpadRight":{"type":"axis","index":9,"dir":1,"rest":-1.2857142686843872}},"updatedAt":"2026-11-14T10:47:49.173Z"}
+{
+  "id": "PowerA Battle Dragon Wireless Controller for PC and Cloud Gaming  - Adapter (Vendor: 20d6 Product: 4024)",
+  "name": "PowerA Battle Dragon Wireless Controller for PC and Cloud Gaming  - Adapter (Vendor: 20d6 Product: 4024)",
+  "bindings": {
+    "a": { "type": "button", "index": 2 },
+    "b": { "type": "button", "index": 1 },
+    "x": { "type": "button", "index": 0 },
+    "y": { "type": "button", "index": 3 },
+    "z": { "type": "button", "index": 5 },
+    "l": { "type": "button", "index": 6 },
+    "r": { "type": "button", "index": 7 },
+    "start": { "type": "button", "index": 9 },
+    "dpadUp": { "type": "button", "index": 12 },
+    "dpadDown": { "type": "button", "index": 13 },
+    "dpadLeft": { "type": "button", "index": 14 },
+    "dpadRight": { "type": "button", "index": 15 }
+  },
+  "updatedAt": "2026-11-14T12:55:00.000Z"
+}

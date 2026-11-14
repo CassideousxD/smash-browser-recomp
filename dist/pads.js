@@ -223,9 +223,17 @@ function readSource(pad, source) {
     const ax = pad.axes[source.index];
     if (typeof ax !== 'number' || Number.isNaN(ax)) return 0;
     const rest = typeof source.rest === 'number' ? source.rest : 0.0;
+    // For trigger axes resting near -1.0 (LT/RT):
+    if (rest <= -0.7) {
+      return ax > -0.3 ? Math.min(1.0, (ax + 1.0) / 2.0) : 0.0;
+    }
+    // Ignore invalid hat switch axes or out-of-range floats
+    if (rest < -1.1 || rest > 1.1) {
+      return 0.0;
+    }
     const diff = ax - rest;
-    if (source.dir > 0 && diff > 0.4) return 1.0;
-    if (source.dir < 0 && diff < -0.4) return 1.0;
+    if (source.dir > 0 && diff > 0.45) return 1.0;
+    if (source.dir < 0 && diff < -0.45) return 1.0;
     return 0;
   }
   return 0;
@@ -236,14 +244,14 @@ export const CALIBRATION_STEPS = [
   { key: 'b', name: 'Special (B)', desc: 'Special move button: Link\'s bow, Kirby abilities, fireballs, and recovery', glyph: 'B', buttonsOnly: true },
   { key: 'x', name: 'Jump (X)', desc: 'Jump button / short hop', glyph: 'X', buttonsOnly: true },
   { key: 'y', name: 'Jump (Y)', desc: 'Jump button / short hop', glyph: 'Y', buttonsOnly: true },
-  { key: 'z', name: 'Grab / Hookshot (Z)', desc: 'Grab opponents, fire Link\'s hookshot & Samus grapple in air', glyph: 'Z', buttonsOnly: false },
+  { key: 'z', name: 'Grab / Hookshot (Z)', desc: 'Grab opponents, fire Link\'s hookshot & Samus grapple in air', glyph: 'Z', buttonsOnly: true },
   { key: 'l', name: 'Shield (L)', desc: 'Shield on ground, air dodge in air (Left trigger or bumper)', glyph: 'L', buttonsOnly: false },
   { key: 'r', name: 'Shield (R)', desc: 'Shield on ground, air dodge in air (Right trigger or bumper)', glyph: 'R', buttonsOnly: false },
   { key: 'start', name: 'Start / Pause', desc: 'Pause match, confirm menus (+ / Start)', glyph: 'Start', buttonsOnly: true },
-  { key: 'dpadUp', name: 'D-Pad UP', desc: 'D-pad Up: taunt up / menu up', glyph: 'D ↑', buttonsOnly: false },
-  { key: 'dpadDown', name: 'D-Pad DOWN', desc: 'D-pad Down: taunt down / menu down', glyph: 'D ↓', buttonsOnly: false },
-  { key: 'dpadLeft', name: 'D-Pad LEFT', desc: 'D-pad Left: taunt left / menu left', glyph: 'D ←', buttonsOnly: false },
-  { key: 'dpadRight', name: 'D-Pad RIGHT', desc: 'D-pad Right: taunt right / menu right', glyph: 'D →', buttonsOnly: false },
+  { key: 'dpadUp', name: 'D-Pad UP', desc: 'D-pad Up: taunt up / menu up', glyph: 'D ↑', buttonsOnly: true },
+  { key: 'dpadDown', name: 'D-Pad DOWN', desc: 'D-pad Down: taunt down / menu down', glyph: 'D ↓', buttonsOnly: true },
+  { key: 'dpadLeft', name: 'D-Pad LEFT', desc: 'D-pad Left: taunt left / menu left', glyph: 'D ←', buttonsOnly: true },
+  { key: 'dpadRight', name: 'D-Pad RIGHT', desc: 'D-pad Right: taunt right / menu right', glyph: 'D →', buttonsOnly: true },
 ];
 
 let wizardState = null;
@@ -420,15 +428,19 @@ export class Pads {
       }
       this.buttons.fill(0);
       this.axes.fill(0);
-      this.axes[0] = pad.axes[0] || 0;
-      this.axes[1] = pad.axes[1] || 0;
-      this.axes[2] = pad.axes[2] || 0;
-      // If axis 3 rests at -1.0 (Left Trigger), C-Stick Y is on axis 5!
+
+      // 15% Deadzone filter for analog sticks so zero-drift leaves stick centered
+      const deadzone = (v, th = 0.15) => (Math.abs(v) < th ? 0.0 : v);
+      this.axes[0] = deadzone(pad.axes[0] || 0, 0.15);
+      this.axes[1] = deadzone(pad.axes[1] || 0, 0.15);
+      this.axes[2] = deadzone(pad.axes[2] || 0, 0.15);
+
+      // If axis 3 rests at -1.0 (Left Trigger), C-Stick Y is on axis 5
+      let cstickY = pad.axes[3] || 0;
       if (pad.axes.length >= 6 && (pad.axes[3] < -0.7 || Math.abs(pad.axes[3]) > 0.8)) {
-        this.axes[3] = pad.axes[5] || 0;
-      } else {
-        this.axes[3] = pad.axes[3] || 0;
+        cstickY = pad.axes[5] || 0;
       }
+      this.axes[3] = deadzone(cstickY, 0.15);
 
       const customProf = getCustomProfile(pad.id);
       if (customProf && Object.keys(customProf).length > 0) {
@@ -458,28 +470,21 @@ export class Pads {
         const zVal = readBinding(customProf.z, 5, 4);
         // Left Shield (L): mapped button/axis, or fallback to LT (6) / LB (4) / Ax3
         let lVal = readBinding(customProf.l, 6, 4);
-        if (customProf.l === undefined && lVal <= 0.1 && pad.axes[3] !== undefined && pad.axes[3] > -0.7) {
+        if (customProf.l === undefined && lVal <= 0.1 && pad.axes[3] !== undefined && pad.axes[3] > -0.3) {
           lVal = Math.min(1.0, (pad.axes[3] + 1.0) / 2.0);
         }
         // Right Shield (R): mapped button/axis, or fallback to RT (7) / RB (5) / Ax4
         let rVal = readBinding(customProf.r, 7, 5);
-        if (customProf.r === undefined && rVal <= 0.1 && pad.axes[4] !== undefined && pad.axes[4] > -0.7) {
+        if (customProf.r === undefined && rVal <= 0.1 && pad.axes[4] !== undefined && pad.axes[4] > -0.3) {
           rVal = Math.min(1.0, (pad.axes[4] + 1.0) / 2.0);
         }
         // Start: mapped button, or fallback to 9 / 8 / 11
         const startVal = readBinding(customProf.start, 9, 8, 11);
-        // D-Pad: mapped button/axis, or fallback to 12..15 and Hat Switch on Ax9
+        // D-Pad: strictly buttons 12..15 (or customProf button mapping)
         let dUp = readBinding(customProf.dpadUp, 12);
         let dDown = readBinding(customProf.dpadDown, 13);
         let dLeft = readBinding(customProf.dpadLeft, 14);
         let dRight = readBinding(customProf.dpadRight, 15);
-        if (customProf.dpadUp === undefined && pad.axes.length > 9 && pad.axes[9] > -1.1) {
-          const hat = pad.axes[9];
-          if (hat >= -1.05 && hat <= -0.6) dUp = 1.0;
-          if (hat >= -0.8 && hat <= 0.0) dRight = 1.0;
-          if (hat >= 0.0 && hat <= 0.6) dDown = 1.0;
-          if (hat >= 0.3 && hat <= 1.05) dLeft = 1.0;
-        }
 
         // Put into this.buttons in standard W3C Gamepad order:
         this.buttons[0] = aVal;      // South: Target::A
@@ -499,47 +504,14 @@ export class Pads {
         this.buttons[14] = dLeft;    // DpadLeft: Target::DpadLeft
         this.buttons[15] = dRight;   // DpadRight: Target::DpadRight
 
-        // D-Pad Stick Assist: if analog stick is resting, D-pad drives movement
-        if (Math.abs(this.axes[0]) < 0.25 && Math.abs(this.axes[1]) < 0.25) {
-          if (dLeft > 0.5) this.axes[0] = -1.0;
-          else if (dRight > 0.5) this.axes[0] = 1.0;
-          if (dUp > 0.5) this.axes[1] = -1.0;
-          else if (dDown > 0.5) this.axes[1] = 1.0;
-        }
       } else {
         pad.buttons.forEach((b, i) => { if (i < INPUTS) this.buttons[i] = b.value || (b.pressed ? 1 : 0); });
-
-        // Smarter D-pad detection fallback if standard buttons 12-15 are unpressed:
-        if (this.buttons[12] === 0 && this.buttons[13] === 0 && this.buttons[14] === 0 && this.buttons[15] === 0) {
-          if (pad.buttons.length >= 16) {
-            if (pad.buttons[16]?.pressed || pad.buttons[16]?.value > 0.5) this.buttons[12] = 1.0;
-            if (pad.buttons[17]?.pressed || pad.buttons[17]?.value > 0.5) this.buttons[13] = 1.0;
-            if (pad.buttons[18]?.pressed || pad.buttons[18]?.value > 0.5) this.buttons[14] = 1.0;
-            if (pad.buttons[19]?.pressed || pad.buttons[19]?.value > 0.5) this.buttons[15] = 1.0;
-          }
-          if (this.buttons[12] === 0 && this.buttons[13] === 0 && this.buttons[14] === 0 && this.buttons[15] === 0) {
-            for (let axIdx = 4; axIdx < pad.axes.length; axIdx++) {
-              const val = pad.axes[axIdx];
-              if (typeof val === 'number' && Math.abs(val) <= 1.05 && Math.abs(val) > 0.05) {
-                if (val >= -1.05 && val <= -0.85) { this.buttons[12] = 1.0; }
-                else if (val >= -0.85 && val <= -0.55) { this.buttons[12] = 1.0; this.buttons[15] = 1.0; }
-                else if (val >= -0.55 && val <= -0.25) { this.buttons[15] = 1.0; }
-                else if (val >= -0.25 && val <= 0.0) { this.buttons[13] = 1.0; this.buttons[15] = 1.0; }
-                else if (val > 0.0 && val <= 0.28) { this.buttons[13] = 1.0; }
-                else if (val >= 0.28 && val <= 0.55) { this.buttons[13] = 1.0; this.buttons[14] = 1.0; }
-                else if (val >= 0.55 && val <= 0.85) { this.buttons[14] = 1.0; }
-                else if (val >= 0.85 && val <= 1.05) { this.buttons[12] = 1.0; this.buttons[14] = 1.0; }
-              }
-            }
-          }
+        // Triggers resting at -1.0 check: only activate when pulled forward past -0.3
+        if (pad.axes[3] !== undefined && pad.axes[3] > -0.3 && this.buttons[6] === 0) {
+          this.buttons[6] = Math.min(1.0, (pad.axes[3] + 1.0) / 2.0);
         }
-
-        // D-Pad Stick Assist fallback: if analog stick is resting, D-pad drives movement
-        if (Math.abs(this.axes[0]) < 0.25 && Math.abs(this.axes[1]) < 0.25) {
-          if (this.buttons[14] > 0.5) this.axes[0] = -1.0;
-          else if (this.buttons[15] > 0.5) this.axes[0] = 1.0;
-          if (this.buttons[12] > 0.5) this.axes[1] = -1.0;
-          else if (this.buttons[13] > 0.5) this.axes[1] = 1.0;
+        if (pad.axes[4] !== undefined && pad.axes[4] > -0.3 && this.buttons[7] === 0) {
+          this.buttons[7] = Math.min(1.0, (pad.axes[4] + 1.0) / 2.0);
         }
       }
 
