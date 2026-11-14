@@ -2010,6 +2010,23 @@ function openNetplayDialog() {
   if (!d) return;
   if (!d.open) d.showModal();
   updateNetplayViews();
+  loadTurnSettings();
+}
+
+function loadTurnSettings() {
+  try {
+    const custom = localStorage.getItem('melee_custom_ice_servers');
+    if (custom) {
+      const parsed = JSON.parse(custom);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const s = parsed[0];
+        const u = Array.isArray(s.urls) ? s.urls[0] : s.urls;
+        if ($('netplay-turn-url')) $('netplay-turn-url').value = u || '';
+        if ($('netplay-turn-user')) $('netplay-turn-user').value = s.username || '';
+        if ($('netplay-turn-pass')) $('netplay-turn-pass').value = s.credential || '';
+      }
+    }
+  } catch {}
 }
 
 function updateNetplayViews() {
@@ -2098,6 +2115,32 @@ window.netplayUI = {
     const st = $('netplay-status-text');
     if (st) st.textContent = 'Click Create Room to get your room code';
     toast('Disconnected from Online');
+  },
+  saveTurnSettings: () => {
+    const url = $('netplay-turn-url')?.value?.trim();
+    const username = $('netplay-turn-user')?.value?.trim();
+    const credential = $('netplay-turn-pass')?.value?.trim();
+    if (!url) {
+      toast('Please enter a valid TURN URL (e.g. turn:your-server.com:3478)');
+      return;
+    }
+    const servers = [
+      { urls: url, username: username || '', credential: credential || '' },
+      { urls: `${url}?transport=tcp`, username: username || '', credential: credential || '' },
+    ];
+    try {
+      localStorage.setItem('melee_custom_ice_servers', JSON.stringify(servers));
+      toast('Custom TURN relay saved! Active on next room.');
+    } catch (e) {
+      toast('Failed to save settings to localStorage');
+    }
+  },
+  resetTurnSettings: () => {
+    localStorage.removeItem('melee_custom_ice_servers');
+    if ($('netplay-turn-url')) $('netplay-turn-url').value = '';
+    if ($('netplay-turn-user')) $('netplay-turn-user').value = '';
+    if ($('netplay-turn-pass')) $('netplay-turn-pass').value = '';
+    toast('Relay settings reset to high-availability defaults');
   },
 };
 

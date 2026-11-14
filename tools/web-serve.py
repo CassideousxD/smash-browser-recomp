@@ -76,6 +76,19 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(b"{}")
             return
 
+        if url_path == "/api/turn-config":
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            turn_path = os.path.join(os.path.dirname(__file__), "..", "config", "turn_servers.json")
+            if os.path.isfile(turn_path):
+                with open(turn_path, "rb") as f:
+                    self.wfile.write(f.read())
+            else:
+                self.wfile.write(b"[]")
+            return
+
         if url_path == "/api/room/poll":
             params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
             code = params.get("code", "").upper()

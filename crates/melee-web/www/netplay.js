@@ -2,17 +2,68 @@
 // Features: Option 1 Hybrid Cloud Relay (ntfy.sh) + Local Server Fallback.
 // No 3rd-party accounts, no tunnels required when friends run locally on their own PCs!
 // Direct UDP DataChannels, 2-frame anti-stutter buffer, live RTT ping, 1v1, Teams, and FFA.
+// Full STUN + TURN relay fallback for Symmetric NAT / CGNAT traversal and candidate queuing.
 
 import { getKeyMap } from './pads.js';
 
-const ICE_SERVERS = [
+export const DEFAULT_ICE_SERVERS = [
+  // Fast Google & Cloudflare STUN servers for direct P2P hole-punching
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:global.stun.metered.ca:80' },
+
+  // Primary Working TURN Relay Fallback (Bypasses Symmetric NAT & CGNAT)
+  {
+    urls: [
+      'turn:turn.evan-brass.net:3478?transport=udp',
+      'turn:turn.evan-brass.net:3478?transport=tcp',
+      'turns:turn.evan-brass.net:443?transport=tcp',
+    ],
+    username: 'user',
+    credential: 'password',
+  },
+
+  // Secondary OpenRelay Project TURN Relay Fallback
+  {
+    urls: [
+      'turn:staticauth.openrelay.metered.ca:80',
+      'turn:staticauth.openrelay.metered.ca:443',
+      'turn:staticauth.openrelay.metered.ca:443?transport=tcp',
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
+
+let cachedServerIce = null;
+fetch('/api/turn-config')
+  .then((res) => res.json())
+  .then((data) => {
+    if (Array.isArray(data) && data.length > 0) cachedServerIce = data;
+  })
+  .catch(() => {});
+
+export function getIceServers() {
+  try {
+    const custom = localStorage.getItem('melee_custom_ice_servers');
+    if (custom) {
+      const parsed = JSON.parse(custom);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return [...parsed, ...(cachedServerIce || []), ...DEFAULT_ICE_SERVERS];
+      }
+    }
+  } catch (err) {
+    console.warn('[Netplay] Could not parse custom ICE servers:', err);
+  }
+  if (cachedServerIce && cachedServerIce.length > 0) {
+    return [...cachedServerIce, ...DEFAULT_ICE_SERVERS];
+  }
+  return DEFAULT_ICE_SERVERS;
+}
 
 export class Netplay {
   constructor(app, pads) {
@@ -28,6 +79,10 @@ export class Netplay {
     this.inputDelay = 2; // 2 frames buffer for smooth 60fps stutter-free play
     this.localPlayer = 0; // 0 for host (P1), 1 for guest (P2)
     this.targetPlayer = 1;
+
+    // ICE Candidate queuing and deduplication
+    this.pendingIceCandidates = [];
+    this.seenIceCandidates = new Set();
 
     // Fixed tick frame queues
     this.currentTick = 0;
@@ -54,6 +109,7 @@ export class Netplay {
     this.pingInterval = null;
     this.offerHandled = false;
     this.answerHandled = false;
+    this.lastPollTimestamp = 0;
   }
 
   get isConnected() {
@@ -89,8 +145,10 @@ export class Netplay {
       body: JSON.stringify({ code: this.roomCode, mode: this.mode }),
     }).catch(() => {});
 
-    // 2. Initialize native WebRTC PeerConnection
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    // 2. Initialize native WebRTC PeerConnection with STUN + TURN configuration
+    const iceServers = getIceServers();
+    console.log('[Netplay] Initializing host PeerConnection with ICE servers:', iceServers);
+    this.pc = new RTCPeerConnection({ iceServers });
 
     // Host creates the unbuffered low-latency DataChannel
     this.dc = this.pc.createDataChannel('melee', { ordered: false, maxRetransmits: 0 });
@@ -98,7 +156,28 @@ export class Netplay {
 
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
-        this.broadcastSignal({ type: 'candidate', candidate: e.candidate });
+        const candPayload = e.candidate.toJSON ? e.candidate.toJSON() : {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex,
+        };
+        this.broadcastSignal({ type: 'candidate', candidate: candPayload });
+      }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      const state = this.pc.iceConnectionState;
+      console.log('[Netplay] Host ICE connection state:', state);
+      if (state === 'checking') {
+        this.updateStatus('Negotiating network path & NAT traversal…');
+      } else if (state === 'connected' || state === 'completed') {
+        this.updateStatus('🟢 Network path established! Pairing opponent…');
+      } else if (state === 'failed') {
+        console.warn('[Netplay] Direct ICE failed. Attempting ICE restart...');
+        this.updateStatus('⚠️ Direct path failed, trying relay fallback…');
+        this.restartIce();
+      } else if (state === 'disconnected') {
+        console.warn('[Netplay] Host ICE disconnected.');
       }
     };
 
@@ -129,8 +208,10 @@ export class Netplay {
     this.status = 'joining';
     this.updateStatus(`Connecting to Room ${this.roomCode}…`);
 
-    // 1. Initialize native WebRTC PeerConnection
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    // 1. Initialize native WebRTC PeerConnection with STUN + TURN configuration
+    const iceServers = getIceServers();
+    console.log('[Netplay] Initializing guest PeerConnection with ICE servers:', iceServers);
+    this.pc = new RTCPeerConnection({ iceServers });
 
     // Guest listens for Host's DataChannel
     this.pc.ondatachannel = (e) => {
@@ -140,7 +221,27 @@ export class Netplay {
 
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
-        this.broadcastSignal({ type: 'candidate', candidate: e.candidate });
+        const candPayload = e.candidate.toJSON ? e.candidate.toJSON() : {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex,
+        };
+        this.broadcastSignal({ type: 'candidate', candidate: candPayload });
+      }
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      const state = this.pc.iceConnectionState;
+      console.log('[Netplay] Guest ICE connection state:', state);
+      if (state === 'checking') {
+        this.updateStatus('Negotiating network path & NAT traversal…');
+      } else if (state === 'connected' || state === 'completed') {
+        this.updateStatus('🟢 Network path established! Pairing with host…');
+      } else if (state === 'failed') {
+        console.warn('[Netplay] Guest ICE failed.');
+        this.updateStatus('⚠️ Connection failed. Check network or firewall.');
+      } else if (state === 'disconnected') {
+        console.warn('[Netplay] Guest ICE disconnected.');
       }
     };
 
@@ -156,6 +257,24 @@ export class Netplay {
 
     // 3. Listen for host offer on both Cloud Relay (ntfy.sh) and Local Server
     this.listenSignals('guest');
+  }
+
+  // --- ICE Restart ---
+  async restartIce() {
+    if (this.role !== 'host' || !this.pc || this.isConnected) return;
+    try {
+      console.log('[Netplay] Performing ICE restart offer...');
+      const offer = await this.pc.createOffer({ iceRestart: true });
+      await this.pc.setLocalDescription(offer);
+      await this.broadcastSignal({
+        type: 'offer',
+        sdp: this.pc.localDescription.sdp,
+        mode: this.mode,
+        iceRestart: true,
+      });
+    } catch (e) {
+      console.warn('[Netplay] ICE restart failed:', e);
+    }
   }
 
   // Broadcast signal to both Cloud Relay (ntfy.sh) and Local server
@@ -181,26 +300,94 @@ export class Netplay {
     }).catch(() => {});
   }
 
-  async handleRemoteOffer(offerSdp) {
-    if (this.offerHandled || !this.pc) return;
+  // Handle incoming Offer SDP from Host
+  async handleRemoteOffer(offerSdp, isRestart = false) {
+    if ((this.offerHandled && !isRestart) || !this.pc) return;
     this.offerHandled = true;
     try {
+      console.log('[Netplay] Setting remote description (Offer)...');
       await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offerSdp }));
+      await this.flushPendingIceCandidates();
+
       const answer = await this.pc.createAnswer();
       await this.pc.setLocalDescription(answer);
       await this.broadcastSignal({ type: 'answer', sdp: this.pc.localDescription.sdp });
     } catch (e) {
       console.error('[Netplay] Error handling remote offer:', e);
+      if (!isRestart) this.offerHandled = false;
     }
   }
 
+  // Handle incoming Answer SDP from Guest
   async handleRemoteAnswer(answerSdp) {
     if (this.answerHandled || !this.pc) return;
     this.answerHandled = true;
     try {
+      console.log('[Netplay] Setting remote description (Answer)...');
       await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answerSdp }));
+      await this.flushPendingIceCandidates();
     } catch (e) {
       console.error('[Netplay] Error handling remote answer:', e);
+      this.answerHandled = false;
+    }
+  }
+
+  // Robust ICE Candidate Queuing: Buffers candidates if remoteDescription is pending
+  async queueOrAddIceCandidate(candidateData) {
+    if (!this.pc || !candidateData) return;
+
+    // Filter null or empty candidate strings (e.g. end of gathering marker)
+    const candStr = typeof candidateData === 'string' ? candidateData : candidateData.candidate;
+    if (!candStr || candStr.trim() === '') return;
+
+    // Deduplicate candidate
+    const candKey = typeof candidateData === 'string'
+      ? candidateData
+      : `${candidateData.candidate}|${candidateData.sdpMid}|${candidateData.sdpMLineIndex}`;
+
+    if (this.seenIceCandidates.has(candKey)) return;
+    this.seenIceCandidates.add(candKey);
+
+    const rtcCandidate = (candidateData instanceof RTCIceCandidate)
+      ? candidateData
+      : new RTCIceCandidate(candidateData);
+
+    // If remoteDescription is not yet set, buffer candidate
+    if (!this.pc.remoteDescription || !this.pc.remoteDescription.type) {
+      console.log('[Netplay] RemoteDescription not set yet; queuing ICE candidate:', candKey);
+      this.pendingIceCandidates.push(rtcCandidate);
+      return;
+    }
+
+    try {
+      await this.pc.addIceCandidate(rtcCandidate);
+      console.log('[Netplay] Successfully applied ICE candidate:', candKey);
+    } catch (err) {
+      if (!this.pc.remoteDescription || !this.pc.remoteDescription.type) {
+        console.warn('[Netplay] RemoteDescription raced; re-queuing ICE candidate:', candKey);
+        this.pendingIceCandidates.push(rtcCandidate);
+      } else {
+        console.warn('[Netplay] Error applying ICE candidate:', err);
+      }
+    }
+  }
+
+  // Drain and apply all queued candidates once remoteDescription is established
+  async flushPendingIceCandidates() {
+    if (!this.pc || !this.pc.remoteDescription || !this.pc.remoteDescription.type) return;
+    if (this.pendingIceCandidates.length === 0) return;
+
+    console.log(`[Netplay] Flushing ${this.pendingIceCandidates.length} queued ICE candidate(s)...`);
+    const queue = [...this.pendingIceCandidates];
+    this.pendingIceCandidates = [];
+
+    for (const cand of queue) {
+      try {
+        await this.pc.addIceCandidate(cand);
+        console.log('[Netplay] Successfully applied flushed ICE candidate:', cand.candidate);
+      } catch (err) {
+        console.warn('[Netplay] Failed to apply flushed ICE candidate:', err);
+      }
     }
   }
 
@@ -212,19 +399,21 @@ export class Netplay {
     // 1. Realtime Cloud SSE Stream via ntfy.sh
     try {
       this.sse = new EventSource(`https://ntfy.sh/${listenTopic}/sse`);
-      this.sse.onmessage = (e) => {
+      this.sse.onmessage = async (e) => {
         try {
           const data = JSON.parse(e.data);
           if (data && data.event === 'message') {
             const sig = JSON.parse(data.message);
-            this.processIncomingSignal(sig);
+            await this.processIncomingSignal(sig);
           }
         } catch {}
       };
     } catch {}
 
-    // 2. Fast Cloud Polling + Local Polling Fallback
+    // 2. Cloud Polling + Local Polling Fallback
     if (this.pollInterval) clearInterval(this.pollInterval);
+    this.lastPollTimestamp = Math.floor(Date.now() / 1000) - 180; // poll messages from past 3 mins
+
     this.pollInterval = setInterval(async () => {
       if (this.isConnected) {
         clearInterval(this.pollInterval);
@@ -234,16 +423,16 @@ export class Netplay {
 
       // Check Cloud Relay
       try {
-        const resp = await fetch(`https://ntfy.sh/${listenTopic}/json?poll=1&since=10m`);
+        const resp = await fetch(`https://ntfy.sh/${listenTopic}/json?poll=1&since=${this.lastPollTimestamp}`);
         const text = await resp.text();
         const lines = text.trim().split('\n');
         for (const line of lines) {
           if (!line) continue;
           try {
             const data = JSON.parse(line);
-            if (data.event === 'message') {
+            if (data && data.event === 'message') {
               const sig = JSON.parse(data.message);
-              this.processIncomingSignal(sig);
+              await this.processIncomingSignal(sig);
             }
           } catch {}
         }
@@ -254,11 +443,11 @@ export class Netplay {
         const resp = await fetch(`/api/room/poll?code=${this.roomCode}&peer=${myRole}`);
         const data = await resp.json();
         if (data.ok) {
-          if (data.offer && !this.offerHandled) this.handleRemoteOffer(data.offer);
-          if (data.answer && !this.answerHandled) this.handleRemoteAnswer(data.answer);
+          if (data.offer && !this.offerHandled) await this.handleRemoteOffer(data.offer);
+          if (data.answer && !this.answerHandled) await this.handleRemoteAnswer(data.answer);
           if (Array.isArray(data.candidates)) {
             for (const cand of data.candidates) {
-              try { await this.pc.addIceCandidate(new RTCIceCandidate(cand)); } catch {}
+              if (cand) await this.queueOrAddIceCandidate(cand);
             }
           }
         }
@@ -266,16 +455,14 @@ export class Netplay {
     }, 350);
   }
 
-  processIncomingSignal(sig) {
+  async processIncomingSignal(sig) {
     if (!sig) return;
     if (sig.type === 'offer') {
-      this.handleRemoteOffer(sig.sdp);
+      await this.handleRemoteOffer(sig.sdp, !!sig.iceRestart);
     } else if (sig.type === 'answer') {
-      this.handleRemoteAnswer(sig.sdp);
-    } else if (sig.type === 'candidate' && sig.candidate && this.pc) {
-      try {
-        this.pc.addIceCandidate(new RTCIceCandidate(sig.candidate));
-      } catch {}
+      await this.handleRemoteAnswer(sig.sdp);
+    } else if (sig.type === 'candidate' && sig.candidate) {
+      await this.queueOrAddIceCandidate(sig.candidate);
     }
   }
 
@@ -288,8 +475,14 @@ export class Netplay {
       this.updateStatus(`🟢 Connected! Peer in Room ${this.roomCode}`);
 
       // Register virtual pad handle 99 for remote opponent
-      this.app.pad_connect(99, 'Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 028e)');
-      this.app.pad_assign(99, this.targetPlayer);
+      if (this.app) {
+        try {
+          this.app.pad_connect(99, 'Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e Product: 028e)');
+          this.app.pad_assign(99, this.targetPlayer);
+        } catch (e) {
+          console.warn('[Netplay] Could not connect virtual pad yet:', e);
+        }
+      }
 
       // Start live RTT ping loop
       this.startPingLoop();
@@ -305,7 +498,9 @@ export class Netplay {
     dc.onclose = () => {
       this.status = 'disconnected';
       this.updateStatus('🔴 Opponent disconnected.');
-      this.app.pad_disconnect(99);
+      if (this.app) {
+        try { this.app.pad_disconnect(99); } catch {}
+      }
       if (this.pingInterval) clearInterval(this.pingInterval);
     };
 
@@ -475,7 +670,7 @@ export class Netplay {
       this.remoteQueue.delete(target);
     }
 
-    if (remote) {
+    if (remote && this.app) {
       const btnArr = new Float32Array(17);
       for (let i = 0; i < 16; i++) {
         if (remote.buttons & (1 << i)) btnArr[i] = 1.0;
@@ -521,6 +716,8 @@ export class Netplay {
     }
     this.offerHandled = false;
     this.answerHandled = false;
+    this.pendingIceCandidates = [];
+    this.seenIceCandidates.clear();
   }
 
   leave() {
