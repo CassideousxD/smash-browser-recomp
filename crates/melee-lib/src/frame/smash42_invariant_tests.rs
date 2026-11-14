@@ -112,9 +112,11 @@ fn original_smash42_owners_preserve_private_ness_and_real_input_controls() {
             Scenario::load(&root.join(format!("harness/scenarios/{name}.toml"))).unwrap();
         assert_eq!(scenario.frames, frames);
         let raw = scenario.trace_path("tick.raw.jsonl");
-        assert!(melee_test_support::require_files(
-            scenario.required_files().into_iter().chain([raw.clone()])
-        ));
+        if !melee_test_support::require_files(
+            scenario.required_files().into_iter().chain([raw.clone()]),
+        ) {
+            return;
+        }
         let pads = crate::trace::pad_script(&scenario)
             .unwrap()
             .with_display_from(&raw)

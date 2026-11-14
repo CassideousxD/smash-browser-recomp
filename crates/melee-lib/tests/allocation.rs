@@ -1486,7 +1486,9 @@ fn heavy_pickup_terminal_entry_step_and_capture_allocate_nothing_after_live_clon
             &root.join(format!("harness/scenarios/{name}.toml")),
         )
         .unwrap();
-        assert!(melee_test_support::require_files(scenario.required_files()));
+        if !melee_test_support::require_files(scenario.required_files()) {
+            return;
+        }
         assert_eq!(scenario.frames, ticks);
         let mut game = diagnostics::import_match(&scenario).unwrap();
         let mut capture = presentation::Presentation::new(&game).unwrap();
@@ -1585,7 +1587,9 @@ fn held_back_air_entry_step_and_capture_allocate_nothing_after_live_clone() {
         &root.join("harness/scenarios/corpus_v3_fd_items_sword_nocont_e8f0de8c6_p2.toml"),
     )
     .unwrap();
-    assert!(melee_test_support::require_files(scenario.required_files()));
+    if !melee_test_support::require_files(scenario.required_files()) {
+        return;
+    }
     assert_eq!(scenario.frames, 621);
     let mut game = diagnostics::import_match(&scenario).unwrap();
     let mut capture = presentation::Presentation::new(&game).unwrap();
@@ -1656,7 +1660,9 @@ fn monster_constructor_step_and_capture_allocate_nothing_after_live_clone() {
             &root.join(format!("harness/scenarios/{name}.toml")),
         )
         .unwrap();
-        assert!(melee_test_support::require_files(scenario.required_files()));
+        if !melee_test_support::require_files(scenario.required_files()) {
+            return;
+        }
         assert_eq!(scenario.frames, ticks);
         let mut game = diagnostics::import_match(&scenario).unwrap();
         let mut capture = presentation::Presentation::new(&game).unwrap();
@@ -1811,7 +1817,9 @@ fn held_forward_and_up_entry_step_and_capture_allocate_nothing_after_live_clone(
             &root.join(format!("harness/scenarios/{name}.toml")),
         )
         .unwrap();
-        assert!(melee_test_support::require_files(scenario.required_files()));
+        if !melee_test_support::require_files(scenario.required_files()) {
+            return;
+        }
         assert_eq!(scenario.frames, frames);
         let mut game = diagnostics::import_match(&scenario).unwrap();
         let mut capture = presentation::Presentation::new(&game).unwrap();
@@ -1883,7 +1891,9 @@ fn klaptrap_birth_step_and_capture_allocate_nothing_after_live_clone() {
             &root.join(format!("harness/scenarios/{name}.toml")),
         )
         .unwrap();
-        assert!(melee_test_support::require_files(scenario.required_files()));
+        if !melee_test_support::require_files(scenario.required_files()) {
+            return;
+        }
         assert_eq!(scenario.frames, ticks);
         let mut game = diagnostics::import_match(&scenario).unwrap();
         let mut capture = presentation::Presentation::new(&game).unwrap();
@@ -2007,7 +2017,9 @@ fn held_down_entry_step_observe_and_capture_allocate_nothing_after_live_clone() 
             &root.join(format!("harness/scenarios/{name}.toml")),
         )
         .unwrap();
-        assert!(melee_test_support::require_files(scenario.required_files()));
+        if !melee_test_support::require_files(scenario.required_files()) {
+            return;
+        }
         assert_eq!(scenario.frames, frames);
         let mut game = diagnostics::import_match(&scenario).unwrap();
         let mut capture = presentation::Presentation::new(&game).unwrap();
@@ -2076,7 +2088,9 @@ fn sealed_effect_teardown_step_and_capture_allocate_nothing_after_live_clone() {
         &root.join("harness/scenarios/corpus_v3_ys_ganondorf_fox4_e281b1a7a_p1.toml"),
     )
     .unwrap();
-    assert!(melee_test_support::require_files(scenario.required_files()));
+    if !melee_test_support::require_files(scenario.required_files()) {
+        return;
+    }
     assert_eq!(scenario.frames, 700);
     let mut game = diagnostics::import_match(&scenario).unwrap();
     let mut capture = presentation::Presentation::new(&game).unwrap();

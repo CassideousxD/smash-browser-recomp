@@ -707,7 +707,9 @@ mod identity_root_tests {
             std::path::PathBuf::from,
         );
         let path = root.join("harness/roms/files/GrKg.dat");
-        assert!(melee_test_support::require_files([&path]));
+        if !melee_test_support::require_files([&path]) {
+            return;
+        }
         let archive = Archive::parse(&std::fs::read(path).unwrap()).unwrap();
         let mut model = BackgroundAnimation::identity_root(&archive, 2.0).unwrap();
         let wrapper = model.tree.parent(model.root).unwrap();

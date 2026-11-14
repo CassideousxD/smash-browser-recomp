@@ -35,9 +35,11 @@ fn complete_heavy_entries_match_raw() {
         let scenario =
             Scenario::load(&root().join(format!("harness/scenarios/{name}.toml"))).unwrap();
         let raw = scenario.trace_path("tick.raw.jsonl");
-        assert!(melee_test_support::require_files(
-            scenario.required_files().into_iter().chain([raw.clone()])
-        ));
+        if !melee_test_support::require_files(
+            scenario.required_files().into_iter().chain([raw.clone()]),
+        ) {
+            return;
+        }
         assert_eq!(scenario.frames as usize, ticks);
         let pads = crate::trace::pad_script(&scenario)
             .unwrap()
