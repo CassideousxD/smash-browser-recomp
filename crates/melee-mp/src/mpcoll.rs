@@ -2418,13 +2418,12 @@ impl CollMap {
                     Side::Right => self.line_get_v1_pos(j),
                     Side::Left => self.line_get_v0_pos(j),
                 };
-                let x;
-                if bot <= pos.y && pos.y <= mid {
+                let x = if bot <= pos.y && pos.y <= mid {
                     // retail 0x800458F8/0x80046688/0x80049500/0x8004A1E4: fmadds.
-                    x = fmadds(f27, pos.y - bot, cd.ecb.bottom.x);
+                    fmadds(f27, pos.y - bot, cd.ecb.bottom.x)
                 } else if mid <= pos.y && pos.y <= top {
                     // retail 0x80045924/0x800466B4/0x8004952C/0x8004A210: fmadds.
-                    x = fmadds(f26, pos.y - top, cd.ecb.top.x);
+                    fmadds(f26, pos.y - top, cd.ecb.top.x)
                 } else if pos.y < bot {
                     break;
                 } else {
@@ -2433,7 +2432,7 @@ impl CollMap {
                         Side::Left => self.line_prev(j),
                     };
                     continue;
-                }
+                };
                 let x = pos.x - x;
                 if better(self, x) {
                     let flags = self.line_get_flags(j);
@@ -2452,13 +2451,12 @@ impl CollMap {
                     Side::Right => self.line_get_v0_pos(wall_id),
                     Side::Left => self.line_get_v1_pos(wall_id),
                 };
-                let x;
-                if bot <= pos.y && pos.y <= mid {
+                let x = if bot <= pos.y && pos.y <= mid {
                     // retail 0x800459FC/0x8004678C/0x80049604/0x8004A2E8: fmadds.
-                    x = fmadds(f27, pos.y - bot, cd.ecb.bottom.x);
+                    fmadds(f27, pos.y - bot, cd.ecb.bottom.x)
                 } else if mid <= pos.y && pos.y <= top {
                     // retail 0x80045A28/0x800467B8/0x80049630/0x8004A314: fmadds.
-                    x = fmadds(f26, pos.y - top, cd.ecb.top.x);
+                    fmadds(f26, pos.y - top, cd.ecb.top.x)
                 } else if pos.y > top {
                     break;
                 } else {
@@ -2467,7 +2465,7 @@ impl CollMap {
                         Side::Left => self.line_next(wall_id),
                     };
                     continue;
-                }
+                };
                 let x = pos.x - x;
                 if better(self, x) {
                     let flags = self.line_get_flags(wall_id);

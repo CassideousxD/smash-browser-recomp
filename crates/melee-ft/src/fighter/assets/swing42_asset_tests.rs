@@ -13,13 +13,15 @@ struct ScriptAudit {
 fn audit_original_scripts(
     indices: std::ops::Range<usize>,
     requests_followup: impl Fn(&Command) -> bool,
-) -> ScriptAudit {
+) -> Option<ScriptAudit> {
     let root = std::env::var_os("MELEE_DATA_ROOT").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
         PathBuf::from,
     );
     let files = root.join("harness/roms/files");
-    assert!(melee_test_support::require_files([files.join("PlCa.dat")]));
+    if !melee_test_support::require_files([files.join("PlCa.dat")]) {
+        return None;
+    }
     let mut paths: Vec<_> = std::fs::read_dir(&files)
         .unwrap()
         .map(|p| p.unwrap().path())
@@ -68,24 +70,26 @@ fn audit_original_scripts(
             }
         }
     }
-    ScriptAudit {
+    Some(ScriptAudit {
         owners,
         copies,
         scripts,
         nonnull,
         writers,
-    }
+    })
 }
 
 #[test]
 fn original_swing_command_owners_only_captain_requests_followup() {
-    let ScriptAudit {
+    let Some(ScriptAudit {
         owners,
         copies,
         scripts,
         nonnull,
         writers,
-    } = audit_original_scripts(108..132, |c| matches!(c, Command::GrabRelease));
+    }) = audit_original_scripts(108..132, |c| matches!(c, Command::GrabRelease)) else {
+        return;
+    };
     assert_eq!((owners, copies, scripts, nonnull), (33, 25, 792, 744));
     assert_eq!(
         writers,
@@ -96,13 +100,13 @@ fn original_swing_command_owners_only_captain_requests_followup() {
 
 #[test]
 fn original_forward_smash_graphs_keep_ness_private_writer_exception() {
-    let ScriptAudit {
+    let Some(ScriptAudit {
         owners,
         copies,
         scripts,
         nonnull,
         writers,
-    } = audit_original_scripts(60..65, |c| {
+    }) = audit_original_scripts(60..65, |c| {
         if let Command::SetVariable { index: 0, value } = c {
             if *value != 0 {
                 assert_eq!(*value, 1, "original common S4 window value");
@@ -110,7 +114,9 @@ fn original_forward_smash_graphs_keep_ness_private_writer_exception() {
             }
         }
         false
-    });
+    }) else {
+        return;
+    };
     assert_eq!((owners, copies, scripts, nonnull), (33, 25, 165, 135));
     // Ness is a real authored writer. Its private bat row, not common S4,
     // owns the IASA; the live ownership test checks that separate join.

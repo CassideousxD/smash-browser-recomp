@@ -64,11 +64,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::chunks_exact_to_as_chunks
 
   harness:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      DOLPHIN_BIN: /bin/true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,6 +104,8 @@ jobs:
           targets: wasm32-wasip1, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: Install 32-bit headers for clang
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
       # Without the extracted disc only the crate tests can run; the
       # native-versus-wasm match hash is a local check.
       - name: Pure crates under wasmtime

@@ -224,10 +224,8 @@ pub fn candidate(
     // character special arms its own.
     let category = if matches!(attacker.motion_state.id, S::Catch | S::CatchDash) {
         1
-    } else if let Some(category) = attacker.status.special_grab {
-        category.0
     } else {
-        return None;
+        attacker.status.special_grab?.0
     };
     if attacker.status.disabled
         || victim.status.disabled
