@@ -18,6 +18,7 @@ pub(super) struct Spline {
     polynomials: Vec<[f32; 5]>,
 }
 impl Spline {
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     pub fn read(archive: &Archive, offset: u32) -> Result<Self> {
         let r = archive.reader();
         ensure!(r.u8(offset)? == 2, "only the warp's B-spline is supported");

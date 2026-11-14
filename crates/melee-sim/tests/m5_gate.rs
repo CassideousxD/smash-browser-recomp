@@ -7330,6 +7330,9 @@ fn inherited_scratch_word_matches_retail_on_every_tick() {
     for name in SCENARIOS {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../harness/scenarios/{name}.toml"));
+        if !melee_test_support::require_files([&path]) {
+            continue;
+        }
         let scenario = Scenario::load(&path).unwrap();
         if !melee_test_support::require_files(scenario.required_files()) {
             continue;
@@ -8035,9 +8038,9 @@ fn item_ordinary_contacts_full_captures_preserve_supported_paths() {
     }
 }
 
-fn complete_capture_with_initial_rng_gate(name: &str, ticks: usize) {
+fn complete_capture_with_initial_rng_gate(name: &str, ticks: usize) -> bool {
     if combat_gate_ticks(name, ticks).is_none() {
-        return;
+        return false;
     }
     let scenario = Scenario::load(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../harness/scenarios/{name}.toml")),
@@ -8099,6 +8102,7 @@ fn complete_capture_with_initial_rng_gate(name: &str, ticks: usize) {
             "{name} tick{tick} ledger cadence seed"
         );
     }
+    true
 }
 
 /// HeavyGet is observed only on the last tick; retain every original row,
@@ -8116,7 +8120,9 @@ fn heavy_pickup_terminal_entries_full_fields_particles_and_ordered_rng() {
         ("corpus_v3_fd_items_sword_efc6a328f_p2", 241, 4_067_602_209),
         ("corpus_v3_fd_items_taru_e1895a33d_p0", 295, 2_394_518_020),
     ] {
-        assert!(combat_gate_ticks(name, ticks).is_some());
+        if combat_gate_ticks(name, ticks).is_none() {
+            continue;
+        }
         let scenario = Scenario::load(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../../harness/scenarios/{name}.toml")),
@@ -8190,7 +8196,9 @@ fn held_sword_common_back_air_entry_complete_captures() {
         ("corpus_v3_fd_items_sword_nocont_e8f0de8c6_p2", 621, 29_272),
         ("corpus_v3_fd_items_sword_nocont_ef9b6d16d_p1", 974, 42_792),
     ] {
-        complete_capture_with_initial_rng_gate(name, frames);
+        if !complete_capture_with_initial_rng_gate(name, frames) {
+            continue;
+        }
         let scenario = Scenario::load(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../harness/scenarios/{name}.toml")),
         )
@@ -8230,7 +8238,9 @@ fn crate_monster_constructors_full_fields_particles_and_ordered_rng() {
         ("corpus_v3_fd_items_sword_e5ca12c3b_p0", 595, 4_067_602_209),
         ("corpus_v3_fd_items_taru_eae02b66b_p2", 285, 2_394_518_020),
     ] {
-        assert!(combat_gate_ticks(name, ticks).is_some());
+        if combat_gate_ticks(name, ticks).is_none() {
+            continue;
+        }
         let scenario = Scenario::load(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../../harness/scenarios/{name}.toml")),
@@ -8309,7 +8319,9 @@ fn held_sword_forward_and_up_entries_complete_captures() {
         ("corpus_v3_fd_items_taru_e8d30e8ed_p1", 1160, 47_255),
         ("corpus_v3_fd_items_taru_ea9c3e366_p1", 1247, 53_263),
     ] {
-        complete_capture_with_initial_rng_gate(name, frames);
+        if !complete_capture_with_initial_rng_gate(name, frames) {
+            continue;
+        }
         let scenario = Scenario::load(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../../harness/scenarios/{name}.toml")),
@@ -8339,7 +8351,9 @@ fn kongo_klaptrap_birth_full_fields_particles_and_ordered_rng() {
         ("corpus_v3_kj_fox_marth4_e75fb4a9a_p0", 74709),
         ("corpus_v3_kj_fox_marth4_e89a89d0e_p0", 76326),
     ] {
-        complete_capture_with_initial_rng_gate(name, 1666);
+        if !complete_capture_with_initial_rng_gate(name, 1666) {
+            continue;
+        }
         let scenario = Scenario::load(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../../harness/scenarios/{name}.toml")),
@@ -8379,7 +8393,9 @@ fn held_sword_down_entries_complete_captures() {
         ("corpus_v3_fd_items_sword_nocont_ecdf8887e_p1", 966, 40431),
         ("corpus_v3_fd_items_taru_e5935012b_p2", 1383, 59023),
     ] {
-        complete_capture_with_initial_rng_gate(name, frames);
+        if !complete_capture_with_initial_rng_gate(name, frames) {
+            continue;
+        }
         let scenario = Scenario::load(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../../harness/scenarios/{name}.toml")),
@@ -8406,7 +8422,10 @@ fn held_sword_down_entries_complete_captures() {
 #[test]
 fn explicit_teardown_before_motion_flush_whole_700_and_genuine_rng() {
     const NAME: &str = "corpus_v3_ys_ganondorf_fox4_e281b1a7a_p1";
-    assert_eq!(combat_gate_ticks(NAME, 700), Some(10_596));
+    let Some(actual_ticks) = combat_gate_ticks(NAME, 700) else {
+        return;
+    };
+    assert_eq!(actual_ticks, 10_596);
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../harness/scenarios/{NAME}.toml"));
     let scenario = Scenario::load(&path).unwrap();

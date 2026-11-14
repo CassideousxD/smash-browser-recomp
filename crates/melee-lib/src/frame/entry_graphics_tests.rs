@@ -13,6 +13,9 @@ fn immediate_entry_graphics_keep_the_joint_read_before_attachment() {
         &root.join("harness/scenarios/corpus_v3_fd_kirby_captainfalcon4_e1cda1301_p1.toml"),
     )
     .unwrap();
+    if !melee_test_support::require_files(scenario.required_files()) {
+        return;
+    }
     let state = InitialState::from_savestate_traces(&scenario).unwrap();
     for immediate in [false, true] {
         let mut fighter = state.fighters[1].clone();

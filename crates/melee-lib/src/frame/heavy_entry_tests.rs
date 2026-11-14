@@ -169,6 +169,9 @@ fn complete_heavy_entries_match_raw() {
 fn pickup_entry_clears_every_throw_flag_and_common_damage_owner_replaces_character() {
     let scenario =
         Scenario::load(&root().join(format!("harness/scenarios/{}.toml", CASES[1].0))).unwrap();
+    if !melee_test_support::require_files(scenario.required_files()) {
+        return;
+    }
     let state = InitialState::from_savestate_traces(&scenario).unwrap();
     for heavy in [false, true] {
         let mut fighter = state.fighters[0].clone();
@@ -277,6 +280,11 @@ fn throw_scratch_tracks_frozen_flag_and_landing_before_retention() {
         let scenario =
             Scenario::load(&root().join(format!("harness/scenarios/{name}.toml"))).unwrap();
         let raw = scenario.trace_path("tick.raw.jsonl");
+        if !melee_test_support::require_files(
+            scenario.required_files().into_iter().chain([raw.clone()]),
+        ) {
+            return;
+        }
         let pads = crate::trace::pad_script(&scenario)
             .unwrap()
             .with_display_from(&raw)

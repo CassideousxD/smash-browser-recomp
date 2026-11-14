@@ -14,7 +14,11 @@ fn scenario() -> Scenario {
 }
 
 fn sealed_after_teardown(sound_only: bool, later_teardown: bool) {
-    let mut state = InitialState::from_savestate_traces(&scenario()).unwrap();
+    let scenario = scenario();
+    if !melee_test_support::require_files(scenario.required_files()) {
+        return;
+    }
+    let mut state = InitialState::from_savestate_traces(&scenario).unwrap();
     let program = state
         .assets
         .common_particle_bank
@@ -128,6 +132,15 @@ fn whole_700_raw_clock_and_landing_generator_lifetime() {
     let scenario = scenario();
     assert_eq!(scenario.frames, 700);
     let raw = scenario.trace_path("tick.raw.jsonl");
+    let meta = scenario.trace_path("particles.jsonl.meta.jsonl");
+    if !melee_test_support::require_files(
+        scenario
+            .required_files()
+            .into_iter()
+            .chain([raw.clone(), meta.clone()]),
+    ) {
+        return;
+    }
     let pads = crate::trace::pad_script(&scenario)
         .unwrap()
         .with_display_from(&raw)
@@ -136,7 +149,6 @@ fn whole_700_raw_clock_and_landing_generator_lifetime() {
         InitialState::from_savestate_traces(&scenario).unwrap(),
         pads,
     );
-    let meta = scenario.trace_path("particles.jsonl.meta.jsonl");
     let mut meta_rows = melee_test_support::trace::open(&meta).unwrap().lines();
     let mut count = 0;
     for (frame, line) in melee_test_support::trace::open(&raw)

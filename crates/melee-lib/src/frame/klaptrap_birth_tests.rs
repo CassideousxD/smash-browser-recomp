@@ -35,6 +35,15 @@ fn complete_klaptrap_birth_raw_parent_pose_and_actual_scheduler_order() {
             Scenario::load(&root().join(format!("harness/scenarios/{name}.toml"))).unwrap();
         assert_eq!(scenario.frames, 1666);
         let raw = scenario.trace_path("tick.raw.jsonl");
+        let meta = scenario.trace_path("particles.jsonl.meta.jsonl");
+        if !melee_test_support::require_files(
+            scenario
+                .required_files()
+                .into_iter()
+                .chain([raw.clone(), meta.clone()]),
+        ) {
+            return;
+        }
         let pads = crate::trace::pad_script(&scenario)
             .unwrap()
             .with_display_from(&raw)

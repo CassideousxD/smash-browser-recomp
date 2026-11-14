@@ -30,6 +30,11 @@ fn complete_monster_births_match_raw_and_run_real_birth_procs() {
             Scenario::load(&root().join(format!("harness/scenarios/{name}.toml"))).unwrap();
         assert_eq!(scenario.frames as usize, ticks);
         let raw = scenario.trace_path("tick.raw.jsonl");
+        if !melee_test_support::require_files(
+            scenario.required_files().into_iter().chain([raw.clone()]),
+        ) {
+            return;
+        }
         let pads = crate::trace::pad_script(&scenario)
             .unwrap()
             .with_display_from(&raw)
