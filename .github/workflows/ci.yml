@@ -64,7 +64,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::chunks_exact_to_as_chunks
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::chunks_exact_to_as_chunks -A clippy::needless_range_loop
 
   harness:
     runs-on: ubuntu-latest

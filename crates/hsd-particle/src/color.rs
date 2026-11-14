@@ -48,9 +48,9 @@ impl ColorTrack {
         self.materialize();
         self.duration = pc.timer()?;
         self.target = self.current;
-        for channel in 0..4 {
+        for (channel, target) in self.target.iter_mut().enumerate() {
             if mask & (1 << channel) != 0 {
-                self.target[channel] = pc.byte()?;
+                *target = pc.byte()?;
             }
         }
         self.restart();
