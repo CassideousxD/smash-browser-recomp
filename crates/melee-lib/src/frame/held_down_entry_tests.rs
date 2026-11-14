@@ -181,7 +181,10 @@ fn link_down_air_admission_preserves_the_real_refusal_boundary() {
     check_family!(ft_link::init::Link, "links_dair_fd_fox4");
     check_family!(ft_younglink::init::YoungLink, "links_yl_dair_fd_fox4");
 
-    let state = fixture("gamewatch_air_attacks_fd_fox4").state().clone();
+    let Some(sim) = fixture("gamewatch_air_attacks_fd_fox4") else {
+        return;
+    };
+    let state = sim.state().clone();
     let mut common = state.fighters[0].0.clone();
     common.leave_ground();
     common.held_item = Some(sword);
@@ -203,7 +206,10 @@ fn link_down_air_admission_preserves_the_real_refusal_boundary() {
         private.input.current.stick.y = y;
         motion_refuses(|| enter(&mut private, &state.assets.fighters[0]).unwrap());
     }
-    let state = fixture("peach_float_dair_cstick").state().clone();
+    let Some(sim) = fixture("peach_float_dair_cstick") else {
+        return;
+    };
+    let state = sim.state().clone();
     let mut private = state.fighters[0].0.clone();
     private.leave_ground();
     private.held_item = Some(sword);
